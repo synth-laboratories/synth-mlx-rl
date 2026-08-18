@@ -71,7 +71,6 @@ print("\nboth api families: container -> proxy -> reward, OK")
 #   1. from this repo:      uv run python scripts/serve_fake.py     (port 8791)
 #   2. from a containers checkout: uv run python <this file>
 #
-# Known gap: the container does not yet seal the proxy_request_id into its
-# trace, so the join between the container's rollout and the proxy's
-# server-side token record cannot be made. That is the deferred TokenCaptureV5
-# work (plan C5/D3). Evaluation does not need it; on-policy RL does.
+# The join is now closed: the container seals a `token_capture` event carrying
+# the proxy_request_ids, and that id resolves against the proxy's server-side
+# token record. See scripts/join_check.py.
