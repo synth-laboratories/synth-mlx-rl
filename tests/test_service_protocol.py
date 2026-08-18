@@ -135,13 +135,31 @@ def test_accumulation_weight_is_a_global_token_total(client) -> None:
     assert step["applied_accumulations"] == 2
 
 
-def test_service_starts_without_mlx_installed() -> None:
-    """The whole portable suite depends on this: no mlx import anywhere."""
+def test_service_starts_without_importing_mlx() -> None:
+    """The whole portable suite depends on this: building the app imports no mlx.
 
+    Checked in a subprocess, deliberately. Asserting on this process's
+    `sys.modules` is order-dependent -- once any MLX-marked test has run in the
+    same session, mlx is legitimately loaded and the assertion fails for a
+    reason that has nothing to do with the service. It would also pass
+    vacuously on a machine where mlx is not installed at all, which is the
+    machine least able to detect a regression here.
+    """
+
+    import subprocess
     import sys
 
-    assert "mlx" not in sys.modules
-    assert "mlx_lm" not in sys.modules
-    app = create_app(engine=FakeEngine())
-    assert app is not None
-    assert "mlx" not in sys.modules
+    probe = (
+        "import sys;"
+        "from synth_mlx_rl.api.app import create_app;"
+        "from synth_mlx_rl.testing.fake_engine import FakeEngine;"
+        "app = create_app(engine=FakeEngine());"
+        "assert app is not None;"
+        "leaked = sorted(m for m in sys.modules if m.split('.')[0] in {'mlx', 'mlx_lm'});"
+        "print('LEAKED:' + ','.join(leaked)) if leaked else print('CLEAN')"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, timeout=120
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "CLEAN", result.stdout

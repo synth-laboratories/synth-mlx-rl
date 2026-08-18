@@ -76,6 +76,35 @@ def _grad_checkpoint(layer: Any, mx: Any) -> None:
     type(layer).__call__ = checkpointed_call
 
 
+def _float32_logits_processor(mx: Any) -> Any:
+    """Build a logits processor that upcasts to float32 before the log-softmax.
+
+    A factory rather than a module-level function because this module imports
+    MLX lazily -- the portable test suite must keep importing it on a machine
+    with no MLX at all.
+
+    mlx-lm computes `logprobs = logits - logsumexp(logits)` in the *model*
+    dtype. For a bfloat16 model that is not merely coarse, it is destructive:
+    bf16 has an 8-bit mantissa, so its spacing near p=1.0 is about 2^-8. Any
+    token the model is confident about -- p greater than roughly 0.996 --
+    rounds to exactly 1.0 and reports a log-probability of exactly 0.0.
+
+    Measured on Qwen3.5-0.8B, every sampled token of a confident completion came
+    back as 0.0. That does not look like a bug downstream; it looks like a
+    perfectly deterministic policy, and it silently zeroes the numerator of
+    every importance ratio and makes the sampler/trainer mismatch check compare
+    real numbers against zeros.
+
+    float32 has a 24-bit mantissa and resolves those probabilities correctly.
+    The cast costs one vocabulary-sized array per generated token.
+    """
+
+    def processor(_tokens: Any, logits: Any) -> Any:
+        return logits.astype(mx.float32)
+
+    return processor
+
+
 class MLXEngine(EngineBase):
     """One resident model, one lock, a training adapter, and frozen snapshots.
 
@@ -368,7 +397,11 @@ class MLXEngine(EngineBase):
             rollout_logprobs: list[float] = []
             finish_reason = "length"
             for token, logprobs in self.generate_step(
-                prompt_array, self.model, max_tokens=max_tokens, sampler=sampler
+                prompt_array,
+                self.model,
+                max_tokens=max_tokens,
+                sampler=sampler,
+                logits_processors=[_float32_logits_processor(self.mx)],
             ):
                 token_id = int(token)
                 self.mx.eval(logprobs)
@@ -377,6 +410,9 @@ class MLXEngine(EngineBase):
                 # log-softmaxed, BEFORE the sampler applied top-p / top-k /
                 # min-p. That is the population the mismatch check needs; a
                 # truncated value would understate the true sampling density.
+                # It is float32 because `_float32_logits` upcast the logits --
+                # see that function for why bf16 here silently destroys the
+                # signal rather than merely coarsening it.
                 rollout_logprobs.append(float(logprobs[token_id].item()))
                 matched_text_stop = any(
                     len(completion) >= len(sequence)
