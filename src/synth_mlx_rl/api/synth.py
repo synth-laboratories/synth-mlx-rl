@@ -19,7 +19,19 @@ from ..rollouts import (
     RolloutRecordQueryResponse,
     RolloutRecordResponse,
 )
-from ..schemas import LogprobsRequest, LogprobsResponse, StrictModel
+from ..mismatch import (
+    MismatchError,
+    MismatchPolicy,
+    measure_mismatch,
+)
+from ..mismatch import tis_weights as compute_tis_weights
+from ..schemas import (
+    LogprobsRequest,
+    LogprobsResponse,
+    MismatchRequest,
+    MismatchResponse,
+    StrictModel,
+)
 from ..snapshots import SnapshotError
 from .common import get_engine, http_error, snapshot_http_error
 
@@ -170,4 +182,88 @@ def logprobs(body: LogprobsRequest, request: Request) -> LogprobsResponse:
         raise snapshot_http_error(exc) from exc
     return LogprobsResponse(
         logprobs=values, policy_snapshot_id=body.policy_snapshot_id
+    )
+
+
+@router.post("/mismatch", response_model=MismatchResponse)
+def mismatch(body: MismatchRequest, request: Request) -> MismatchResponse:
+    """Close the logprob lifecycle for one recorded call, in one round trip.
+
+    Fetch the record, recompute `behavior_logprobs` under the snapshot it was
+    actually sampled under, align them to the completion tokens, measure the
+    disagreement, and return a verdict. This exists as one endpoint because the
+    steps are only meaningful together: behavior logprobs scored under a
+    *different* snapshot than the record names measure nothing, and a caller
+    assembling the sequence by hand is one mistake away from a confident number
+    about the wrong comparison.
+
+    The three verdicts mean different things to the caller:
+      ok                the two paths agree; train as collected
+      correct_with_tis  they disagree tolerably; `tis_weights` is returned
+      refuse            the collection is disqualified; do not train on it
+    """
+
+    engine = get_engine(request)
+    try:
+        record = engine.rollouts.get(body.proxy_request_id)
+    except RolloutRecordNotFoundError as exc:
+        raise http_error("rollout_record_not_found", str(exc), 404) from exc
+
+    snapshot_id = body.policy_snapshot_id or record.policy_snapshot_id
+    sequence = list(record.prompt_token_ids) + list(record.completion_token_ids)
+    try:
+        scored = engine.score_logprobs(sequence, policy_snapshot_id=snapshot_id)
+    except SnapshotError as exc:
+        raise snapshot_http_error(exc) from exc
+
+    # `score_logprobs` returns one entry per token with a leading None: the
+    # first token of the sequence has no predecessor to be predicted from. The
+    # completion's behavior logprobs are the tail, and taking that slice wrong
+    # is exactly the off-by-one that makes a mismatch metric look plausible.
+    completion_length = len(record.completion_token_ids)
+    behavior = [
+        0.0 if value is None else float(value)
+        for value in scored[len(sequence) - completion_length :]
+    ]
+
+    policy = MismatchPolicy(
+        **{
+            key: value
+            for key, value in (
+                ("ok_abs_diff", body.ok_abs_diff),
+                ("max_abs_diff", body.max_abs_diff),
+                ("min_ess_ratio", body.min_ess_ratio),
+            )
+            if value is not None
+        }
+    )
+    try:
+        report = policy.evaluate(
+            measure_mismatch(
+                behavior_logprobs=behavior,
+                rollout_logprobs=record.rollout_logprobs,
+            )
+        )
+    except MismatchError as exc:
+        raise http_error("mismatch_unmeasurable", str(exc), 422) from exc
+
+    weights = None
+    if report.verdict == "correct_with_tis":
+        weights = [
+            float(value)
+            for value in compute_tis_weights(
+                behavior_logprobs=behavior,
+                rollout_logprobs=record.rollout_logprobs,
+                clip_low=body.tis_clip_low,
+                clip_high=body.tis_clip_high,
+            ).weights
+        ]
+
+    return MismatchResponse(
+        proxy_request_id=record.proxy_request_id,
+        policy_snapshot_id=snapshot_id,
+        behavior_logprobs=behavior,
+        rollout_logprobs=list(record.rollout_logprobs),
+        report=report.to_dict(),
+        tis_weights=weights,
     )

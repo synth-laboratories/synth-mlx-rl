@@ -346,6 +346,34 @@ class LogprobsResponse(StrictModel):
     policy_snapshot_id: str | None = None
 
 
+class MismatchRequest(StrictModel):
+    """Ask the service to close the logprob lifecycle for one recorded call."""
+
+    proxy_request_id: str
+    #: Defaults to the snapshot the record was sampled under, which is the only
+    #: snapshot the comparison is meaningful against. Overriding it measures
+    #: something else, so it must be said out loud.
+    policy_snapshot_id: str | None = None
+    ok_abs_diff: float | None = None
+    max_abs_diff: float | None = None
+    min_ess_ratio: float | None = None
+    tis_clip_low: float = 0.5
+    tis_clip_high: float = 1.5
+
+
+class MismatchResponse(StrictModel):
+    proxy_request_id: str
+    policy_snapshot_id: str
+    #: Recomputed by the trainer under the pinned snapshot. A different
+    #: population from the record's `rollout_logprobs`.
+    behavior_logprobs: list[float]
+    rollout_logprobs: list[float]
+    report: dict[str, object]
+    #: Present only when the verdict is `correct_with_tis`; a caller that gets
+    #: `ok` needs no correction and one that gets `refuse` must not train.
+    tis_weights: list[float] | None = None
+
+
 class CheckpointRequest(StrictModel):
     name: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 

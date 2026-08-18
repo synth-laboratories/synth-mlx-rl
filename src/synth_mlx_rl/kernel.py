@@ -114,6 +114,7 @@ def policy_terms(
     reference_logprobs: Any | None = None,
     reference_mask: Any | None = None,
     entropy: Any | None = None,
+    tis_weights: Any | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     """Every policy objective in one expression tree.
 
@@ -164,6 +165,16 @@ def policy_terms(
     else:  # importance_sampling
         per_token = ratio * advantages
         clipped_tokens = ops.scalar(0.0)
+
+    if tis_weights is not None:
+        # Truncated importance sampling multiplies in AFTER the objective has
+        # formed its own surrogate and never inside its clip. The two corrections
+        # answer different questions -- how far the policy moved since collection
+        # versus whether the sampler and the trainer agree about the same weights
+        # -- and a codebase that folds them together can report neither honestly.
+        # Detached: this is a measured property of the collection, not a thing
+        # being optimized.
+        per_token = per_token * ops.stop_gradient(tis_weights)
 
     policy_loss = -ops.sum(per_token * weights) / token_count
     approx_kl = ops.sum(ops.square(log_ratio) * weights) / (
