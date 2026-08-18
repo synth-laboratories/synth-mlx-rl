@@ -1,0 +1,61 @@
+synth-mlx-rl
+Copyright 2026 Synth Laboratoires
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+--------------------------------------------------------------------------------
+Third-party origin
+--------------------------------------------------------------------------------
+
+Portions of `src/synth_mlx_rl/` are derived from the `mlx-local-rl` prototype
+(package `mlx-local-rl`, version 0.2.0), which is distributed under the MIT
+License. The derived material includes the pre-shifted `Datum` representation and
+its alignment validation, the prompt/completion alignment helper, the resident
+MLX LoRA engine (gradient accumulation with a global unmasked-token reduction,
+the indexed target-logprob path, checkpoint save/load), the pure-NumPy objective
+reference, the native HTTP client, the FastAPI service skeleton, and the
+deterministic fake engine used by the portable test suite.
+
+The upstream MIT notice is reproduced below in full, as its terms require. The
+upstream notice names no copyright holder; it is reproduced verbatim rather than
+restated. Confirm authorship provenance before the first public release of this
+package.
+
+    MIT License
+
+    Copyright (c) 2026
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+--------------------------------------------------------------------------------
+Algorithm references (no code reproduced)
+--------------------------------------------------------------------------------
+
+`cispo_minimax` implements the CISPO objective of MiniMax-M1
+(https://arxiv.org/abs/2506.13585, Eq. 4-5). It was written against the published
+equations and the SLIME implementation (`slime/utils/ppo_utils.py`,
+`compute_cispo_loss`, Apache-2.0) as a semantic reference. No SLIME source is
+reproduced here. SLIME's input convention is `ppo_kl = old - new`, so its
+`ratio = exp(-ppo_kl)`; this package computes `ratio = exp(current - behavior)`
+directly, which is the same quantity.
+
+`prem-research/mlx-tinker` carries no license and no license metadata. No portion
+of it is reproduced, adapted, or derived from in this package. Its `cispo_loss`
+is additionally a two-sided, advantage-sign-selected variant and is not a
+reference for `cispo_minimax`.
