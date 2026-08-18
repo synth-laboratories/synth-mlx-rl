@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 from .. import __version__
 from ..config import Settings
 from ..protocols import LearnerEngine
+from ..serialize import SingleThreadEngine
 from ..schemas import (
     CheckpointRequest,
     CheckpointResponse,
@@ -70,14 +71,26 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        # MLX streams are thread-local and FastAPI runs `def` endpoints in a
+        # worker pool, so an engine built on this thread and called from there
+        # raises `There is no Stream(gpu, N) in current thread` inside mx.eval.
+        # The engine is therefore BUILT on the worker too, not merely called
+        # from it; see serialize.py.
         if engine is not None:
-            app.state.engine = engine
+            app.state.engine = SingleThreadEngine(engine)
         else:
-            from ..engine import MLXEngine
 
-            app.state.engine = MLXEngine(configured_settings)
+            def build() -> Any:
+                from ..engine import MLXEngine
+
+                return MLXEngine(configured_settings)
+
+            app.state.engine = SingleThreadEngine(factory=build)
         app.state.idempotency = IdempotencyCache()
-        yield
+        try:
+            yield
+        finally:
+            app.state.engine.shutdown()
 
     app = FastAPI(
         title="synth-mlx-rl",
