@@ -12,6 +12,8 @@ and how to copy the training adapter.
 
 from __future__ import annotations
 
+import logging
+
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -28,6 +30,9 @@ from .schemas import (
     SampleResponse,
 )
 from .snapshots import PolicySnapshot, SnapshotPool
+
+
+logger = logging.getLogger(__name__)
 
 
 class EngineBase(ABC):
@@ -170,11 +175,25 @@ class EngineBase(ABC):
             batch_generate = getattr(self, "generate_batch", None)
             if callable(batch_generate) and request.num_samples > 1:
                 started = now_ms()
-                generated = batch_generate(rendered.token_ids, request)
+                try:
+                    generated = batch_generate(rendered.token_ids, request)
+                except Exception as exc:  # noqa: BLE001 - width is an optimization
+                    # A batch wide enough to exhaust device memory must degrade
+                    # to the sequential path rather than fail the whole request:
+                    # the batch is a throughput choice, not a semantic one, and
+                    # both paths produce the same tokens.
+                    logger.warning(
+                        "batched sampling failed (%s: %s); falling back to sequential",
+                        type(exc).__name__, exc,
+                    )
+                    generated = None
                 # One wall-clock measurement covers the batch; splitting it
                 # evenly is a report of cost per sample, not a claim that each
                 # was produced independently.
-                per_sample_ms = (now_ms() - started) / max(len(generated), 1)
+                per_sample_ms = (
+                    (now_ms() - started) / max(len(generated), 1)
+                    if generated is not None else None
+                )
             else:
                 generated = None
                 per_sample_ms = None
