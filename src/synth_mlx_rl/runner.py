@@ -19,6 +19,23 @@ class TrainingEngine(Protocol):
     def score_logprobs(self, token_ids: list[int], *, policy_snapshot_id: str | None = None): ...
 
 
+def _mlx_peak_memory() -> int | None:
+    """Peak MLX allocation so far, or None when MLX is not loaded.
+
+    Recorded per step because memory is the binding constraint on this
+    hardware: the same 768-token datum peaks at 7.30 GB with gradient
+    checkpointing and 33.40 GB without, and above Metal's recommended working
+    set the allocator thrashes and step time goes superlinear. A run that does
+    not record it cannot explain why it got slow.
+    """
+
+    try:
+        import mlx.core as mx
+    except ImportError:
+        return None
+    return int(mx.get_peak_memory())
+
+
 class Cancelled(Exception):
     """Raised when a user-cancelled job reaches a safe step boundary."""
 
@@ -247,7 +264,7 @@ class TrainingRunner:
                 step,
                 loss=forward.loss,
                 throughput=float(forward.metrics.get("token_count", 0.0)),
-                memory=None,
+                memory=_mlx_peak_memory(),
             )
             if step % job.config.checkpoint_every == 0 or step == job.config.max_steps:
                 saved = engine.save_checkpoint(f"{job.job_id}-step-{step:06d}")
