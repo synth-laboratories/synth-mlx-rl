@@ -68,15 +68,6 @@ class LocalTrainingService:
                     supported=apple_silicon,
                     reason=None if apple_silicon else "requires macOS arm64",
                 ),
-                "fixture_training": Capability(supported=True),
-                "mlx_scalar_smoke": Capability(
-                    supported=apple_silicon and mlx_available,
-                    reason=(
-                        None
-                        if apple_silicon and mlx_available
-                        else "MLX unavailable or unsupported platform"
-                    ),
-                ),
                 "qwen_lora_training": Capability(
                     supported=qwen_available,
                     reason=(
@@ -152,18 +143,13 @@ class LocalTrainingService:
             supported=free >= disk_needed,
             reason=None if free >= disk_needed else f"need {disk_needed} bytes; have {free}",
         )
-        capability_name = {
-            "fixture": "fixture_training",
-            "mlx_scalar_smoke": "mlx_scalar_smoke",
-            "qwen_lora": "qwen_lora_training",
-        }[config.backend]
-        capability = self.capabilities().capabilities[capability_name]
-        if config.backend == "qwen_lora" and config.base_model != "Qwen/Qwen3.5-0.8B":
+        capability = self.capabilities().capabilities["qwen_lora_training"]
+        if config.base_model != "Qwen/Qwen3.5-0.8B":
             capability = Capability(
                 supported=False,
                 reason="v0.6 local SFT supports exactly Qwen/Qwen3.5-0.8B",
             )
-        if config.backend == "qwen_lora" and (
+        if (
             config.base_model != self.settings.model
             or config.lora_rank != self.settings.lora_rank
             or config.lora_alpha != self.settings.lora_alpha
@@ -344,22 +330,17 @@ def create_app(
         if not job.checkpoints:
             raise HTTPException(status_code=409, detail="no checkpoint is available")
         checkpoint = job.checkpoints[-1]
-        qwen_lora = job.config.backend == "qwen_lora"
         evaluation = dict(job.evaluation)
         if "status" not in evaluation:
             evaluation.update(
                 status="not_run",
-                reason=(
-                    "evaluation dataset was not configured"
-                    if qwen_lora
-                    else "fixture/smoke backends do not create a deployable model"
-                ),
+                reason="evaluation dataset was not configured",
             )
         return Handoff(
             job_id=job_id,
             checkpoint=checkpoint,
             inference={
-                "kind": "mlx-lora.v1" if qwen_lora else "non_inference_smoke_checkpoint",
+                "kind": "mlx-lora.v1",
                 "path": checkpoint.path,
                 "requested_base_model": job.config.base_model,
             },

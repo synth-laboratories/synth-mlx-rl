@@ -40,12 +40,14 @@ class DatasetSpec(BaseModel):
 class TrainingConfig(BaseModel):
     """A bounded, local-only training request.
 
-    `fixture` and `mlx_scalar_smoke` exist only for service contract tests.
-    Workshop's product SFT path uses `qwen_lora`; capability preflight refuses
-    it unless the real Qwen/MLX stack is available.
+    One backend. `qwen_lora` performs a real LoRA fine-tune through the
+    resident MLX engine and produces a deployable adapter; capability preflight
+    refuses it unless the Qwen/MLX stack is actually available. Nothing else is
+    offered, because a job that cannot produce a usable model has no business
+    on a product surface -- tests inject a fake *engine*, never a fake backend.
     """
 
-    backend: Literal["fixture", "mlx_scalar_smoke", "qwen_lora"] = "fixture"
+    backend: Literal["qwen_lora"] = "qwen_lora"
     base_model: str = "Qwen/Qwen3.5-0.8B"
     dataset: DatasetSpec
     evaluation_dataset: DatasetSpec | None = None
