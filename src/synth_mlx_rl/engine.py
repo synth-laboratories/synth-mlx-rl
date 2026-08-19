@@ -349,6 +349,120 @@ class MLXEngine(EngineBase):
 
     # -- generation ------------------------------------------------------
 
+    def generate_batch(
+        self, prompt_token_ids: list[int], request: SampleRequest
+    ) -> list[tuple[list[int], list[float], str]]:
+        """Decode `num_samples` completions of one prompt in a single batch.
+
+        Group sampling is the ideal batching case: every member shares an
+        identical prompt, so the prefill is done once and the decode runs as one
+        [B, 1] step per token instead of B separate [1, 1] steps. On Apple
+        Silicon the decode is memory-bandwidth bound -- the weights are read
+        once per step regardless of B -- so widening the batch is close to free
+        until B gets large.
+
+        mlx-lm ships `batch_generate`, but it returns only text and stats. The
+        rollout log-probabilities are the training authority here, so this
+        decodes directly and records the log-probability of each sampled token
+        from the same float32 distribution the sampler drew from.
+        """
+
+        mx = self.mx
+        from mlx_lm.models.cache import make_prompt_cache
+
+        count = int(request.num_samples)
+        available = self.settings.max_seq_length - len(prompt_token_ids)
+        max_tokens = min(request.max_tokens, available)
+        if max_tokens <= 0:
+            raise ValueError("no generation room remains under max_seq_length")
+
+        stop_ids = set(self._eos_token_ids)
+        if request.stop_token_ids:
+            stop_ids.update(int(token_id) for token_id in request.stop_token_ids)
+        stop_sequences = self._stop_sequences(request)
+
+        sampler = self.make_sampler(
+            temp=request.temperature,
+            top_p=request.top_p,
+            min_p=request.min_p,
+            top_k=request.top_k,
+        )
+        if request.seed is not None:
+            mx.random.seed(int(request.seed))
+
+        self.model.eval()
+        try:
+            cache = make_prompt_cache(self.model)
+            tokens = mx.array([list(prompt_token_ids)] * count)
+            logits = self.model(tokens, cache=cache)[:, -1, :]
+
+            completions: list[list[int]] = [[] for _ in range(count)]
+            logprob_rows: list[list[float]] = [[] for _ in range(count)]
+            finish: list[str] = ["length"] * count
+            live = [True] * count
+
+            for _ in range(max_tokens):
+                # float32 before the log-softmax. In the model dtype (bf16) any
+                # token with p > ~0.996 rounds to exactly 1.0 and reports a
+                # log-probability of 0.0; see `_float32_logits_processor`.
+                logprobs = logits.astype(mx.float32)
+                logprobs = logprobs - mx.logsumexp(logprobs, axis=-1, keepdims=True)
+                sampled = sampler(logprobs)
+                chosen = mx.take_along_axis(
+                    logprobs, sampled.reshape(count, 1), axis=-1
+                ).reshape(count)
+                mx.eval(sampled, chosen)
+
+                sampled_ids = [int(value) for value in sampled.tolist()]
+                chosen_values = [float(value) for value in chosen.tolist()]
+                for row in range(count):
+                    if not live[row]:
+                        continue
+                    token_id = sampled_ids[row]
+                    completions[row].append(token_id)
+                    logprob_rows[row].append(chosen_values[row])
+                    matched = any(
+                        len(completions[row]) >= len(sequence)
+                        and completions[row][-len(sequence):] == sequence
+                        for sequence in stop_sequences
+                    )
+                    if token_id in stop_ids or matched:
+                        finish[row] = "stop"
+                        live[row] = False
+                if not any(live):
+                    break
+                # Finished rows keep stepping so the batch stays rectangular;
+                # their output is discarded by the `live` check above. Dropping
+                # them mid-flight would mean rebuilding the KV cache.
+                logits = self.model(sampled.reshape(count, 1), cache=cache)[:, -1, :]
+
+            return [
+                (completions[row], logprob_rows[row], finish[row])
+                for row in range(count)
+            ]
+        finally:
+            self._set_training_mode(lora_dropout=True)
+            self._maybe_clear_cache()
+
+    def _stop_sequences(self, request: SampleRequest) -> list[list[int]]:
+        raw_stops = (
+            [request.stop] if isinstance(request.stop, str) else (request.stop or [])
+        )
+        return [
+            sequence
+            for sequence in (
+                [
+                    int(token_id)
+                    for token_id in self.tokenizer.encode(
+                        stop_text, add_special_tokens=False
+                    )
+                ]
+                for stop_text in raw_stops
+                if stop_text
+            )
+            if sequence
+        ]
+
     def _generate(
         self, prompt_token_ids: list[int], request: SampleRequest, sample_index: int
     ) -> tuple[list[int], list[float], str]:

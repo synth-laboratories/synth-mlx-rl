@@ -164,13 +164,32 @@ class EngineBase(ABC):
             sampling_params = request.sampling_params()
             self._activate(snapshot)
             samples: list[Sample] = []
+            # An engine that can decode a whole group in one batch does so:
+            # every member shares this prompt, so the prefill happens once and
+            # the decode is one wide step per token instead of N narrow ones.
+            batch_generate = getattr(self, "generate_batch", None)
+            if callable(batch_generate) and request.num_samples > 1:
+                started = now_ms()
+                generated = batch_generate(rendered.token_ids, request)
+                # One wall-clock measurement covers the batch; splitting it
+                # evenly is a report of cost per sample, not a claim that each
+                # was produced independently.
+                per_sample_ms = (now_ms() - started) / max(len(generated), 1)
+            else:
+                generated = None
+                per_sample_ms = None
+
             try:
                 for sample_index in range(request.num_samples):
                     started = now_ms()
-                    completion, rollout_logprobs, finish_reason = self._generate(
-                        rendered.token_ids, request, sample_index
-                    )
-                    duration_ms = now_ms() - started
+                    if generated is not None:
+                        completion, rollout_logprobs, finish_reason = generated[sample_index]
+                        duration_ms = per_sample_ms
+                    else:
+                        completion, rollout_logprobs, finish_reason = self._generate(
+                            rendered.token_ids, request, sample_index
+                        )
+                        duration_ms = now_ms() - started
                     record = RolloutRecord(
                         proxy_request_id=new_proxy_request_id(),
                         policy_snapshot_id=snapshot.id,
