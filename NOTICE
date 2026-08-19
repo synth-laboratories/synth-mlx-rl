@@ -16,10 +16,16 @@ the indexed target-logprob path, checkpoint save/load), the pure-NumPy objective
 reference, the native HTTP client, the FastAPI service skeleton, and the
 deterministic fake engine used by the portable test suite.
 
-The upstream MIT notice is reproduced below in full, as its terms require. The
-upstream notice names no copyright holder; it is reproduced verbatim rather than
-restated. Confirm authorship provenance before the first public release of this
-package.
+The source received for this derivation was the local `mlx-local-rl` 0.2.0
+distribution. Its `pyproject.toml` identifies the author only as "Prototype
+generated for local experimentation" and provides no source repository URL; its
+LICENSE names no holder. No stronger attribution can be substantiated from the
+supplied distribution. The upstream MIT notice is therefore reproduced below
+verbatim, without inventing or substituting a copyright holder. This preserves
+the complete attribution supplied by the upstream artifact. The received
+distribution's `MANIFEST.sha256`, LICENSE, and `pyproject.toml` have SHA-256
+digests `ceda0479...ca0d09`, `1126322...ef685`, and `7fcd8ec...a9910d`
+respectively; full digests are retained in the v0.6 release receipt.
 
     MIT License
 
