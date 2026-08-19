@@ -184,6 +184,17 @@ def test_qwen_lora_job_persists_real_adapter_contract_and_render_lineage(
         },
     }
     with TestClient(create_app(root, settings=settings, engine=engine)) as client:
+        capabilities = client.get("/v1/capabilities").json()
+        assert capabilities["qwen_lora_contract"] == {
+            "backend": "qwen_lora",
+            "base_model": "Qwen/Qwen3.5-0.8B",
+            "lora_rank": 8,
+            "lora_alpha": 16.0,
+            "max_seq_length": 1024,
+            "enable_thinking": False,
+            "adapter_kind": "mlx-lora.v1",
+            "renderer": "qwen-chat-template.v1",
+        }
         preflight = client.post("/v1/jobs/preflight", json=payload).json()
         assert preflight["accepted"] is True
         assert client.post("/v1/jobs", json=payload).status_code == 201

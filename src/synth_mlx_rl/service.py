@@ -94,6 +94,16 @@ class LocalTrainingService:
                     reason="local job API only in this closure slice",
                 ),
             },
+            qwen_lora_contract={
+                "backend": "qwen_lora",
+                "base_model": self.settings.model,
+                "lora_rank": self.settings.lora_rank,
+                "lora_alpha": self.settings.lora_alpha,
+                "max_seq_length": self.settings.max_seq_length,
+                "enable_thinking": self.settings.enable_thinking,
+                "adapter_kind": "mlx-lora.v1",
+                "renderer": "qwen-chat-template.v1",
+            },
         )
 
     def preflight(self, request: ConfigureRequest) -> Preflight:

@@ -123,6 +123,7 @@ class Capabilities(BaseModel):
     memory_bytes: int | None
     available_disk_bytes: int
     capabilities: dict[str, Capability]
+    qwen_lora_contract: dict[str, object]
 
 
 class Preflight(BaseModel):
