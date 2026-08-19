@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "synth-mlx-rl"
-version = "0.0.1"
-description = "Native reinforcement learning for Apple MLX, with a Tinker-compatible API."
+version = "0.6.0"
+description = "Native Apple MLX LoRA SFT and RL with durable Workshop job APIs."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
@@ -21,6 +21,26 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
   "Typing :: Typed",
 ]
+dependencies = [
+  "fastapi>=0.115,<1",
+  "httpx>=0.27,<1",
+  "numpy>=2.0,<3",
+  "pydantic>=2.8,<3",
+  "uvicorn[standard]>=0.30,<1",
+]
+
+[project.optional-dependencies]
+mlx = [
+  "mlx>=0.32,<0.33",
+  "mlx-lm>=0.31.3,<0.32",
+]
+dev = [
+  "pytest>=8,<10",
+  "ruff>=0.9,<1",
+]
+
+[project.scripts]
+synth-mlx-rl = "synth_mlx_rl.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/synth-laboratories/synth-mlx-rl"
@@ -29,3 +49,21 @@ Issues = "https://github.com/synth-laboratories/synth-mlx-rl/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/synth_mlx_rl"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "docs", "scripts", "LICENSE", "NOTICE", "README.md"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+  "mlx: requires a working `mlx` runtime (Apple Silicon); skipped everywhere else",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]

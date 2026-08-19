@@ -1,0 +1,32 @@
+{
+  "mode": "sft",
+  "baseline": 0.45,
+  "final": 0.5833333333333334,
+  "uplift": 0.13333333333333336,
+  "eval_n": 60,
+  "adapter_digest": "sha256:5578825b5ff729f57d0d556f1dd433f727343ae47a0a1f31f88634469c344d59",
+  "history": [
+    {
+      "stage": "sft",
+      "steps": 25,
+      "accepted": 100,
+      "train_tokens": 28488,
+      "train_seconds": 516.9444310665131,
+      "train_tokens_per_s": 55.10843775070007
+    }
+  ],
+  "args": {
+    "mode": "sft",
+    "eval_n": 60,
+    "train_prompts": 48,
+    "group": 16,
+    "epochs": 1,
+    "lr": 0.0001,
+    "max_tokens": 1024,
+    "accum": 4,
+    "max_traces": 100,
+    "cache": "runs/traces_hi.jsonl",
+    "rounds": 8,
+    "out": "runs/sft_hi.json"
+  }
+}

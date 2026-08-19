@@ -1,0 +1,10 @@
+=== GPU free at 23:52:16 ===
+[guard] admitted: 57.6 GB free, expect ~4.0 GB, pid 14703
+Fetching 10 files:   0%|          | 0/10 [00:00<?, ?it/s]Fetching 10 files: 100%|██████████| 10/10 [00:00<00:00, 2864.57it/s]
+grad_checkpoint = True
+   len    wall ms   peak GB    tok/s
+   512       4614      5.36     55.5
+   768       7988      7.32     48.1
+  1024      13193      9.68     38.8
+  1536      21867     14.95     35.1
+  2048      38910     20.87     26.3
