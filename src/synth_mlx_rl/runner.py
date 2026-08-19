@@ -17,6 +17,7 @@ class TrainingEngine(Protocol):
     def forward_backward(self, request): ...
     def optim_step(self, params): ...
     def save_checkpoint(self, name: str): ...
+    def score_logprobs(self, token_ids: list[int], *, policy_snapshot_id: str | None = None): ...
 
 
 class Cancelled(Exception):
@@ -190,89 +191,103 @@ class TrainingRunner:
         )
 
         engine = self._engine_provider()
-        rows: list[list[ChatMessage]] = []
-        for line_number, line in enumerate(
-            Path(job.config.dataset.path).read_text(encoding="utf-8").splitlines(), start=1
-        ):
-            if not line.strip():
-                continue
-            raw = json.loads(line)
-            if isinstance(raw.get("messages"), list):
-                messages = [ChatMessage.model_validate(item) for item in raw["messages"]]
-            elif isinstance(raw.get("prompt"), str) and isinstance(raw.get("completion"), str):
-                messages = [
-                    ChatMessage(role="user", content=raw["prompt"]),
-                    ChatMessage(role="assistant", content=raw["completion"]),
-                ]
-            else:
-                raise ValueError(
-                    f"dataset line {line_number} needs messages or prompt/completion"
-                )
-            if not messages or messages[-1].role != "assistant":
-                raise ValueError(f"dataset line {line_number} must end with assistant")
-            rows.append(messages)
-        if not rows:
-            raise ValueError("dataset contains no training rows")
 
-        datums: list[Datum] = []
-        template_digest: str | None = None
-        render_digests: list[str] = []
-        for messages in rows:
-            full = engine.render_chat(
-                RenderChatRequest(
-                    messages=messages,
-                    tokenize=True,
-                    add_generation_prompt=False,
-                    enable_thinking=job.config.enable_thinking,
+        def render_dataset(path: Path, label: str):
+            rows: list[list[ChatMessage]] = []
+            for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                if not line.strip():
+                    continue
+                raw = json.loads(line)
+                if isinstance(raw.get("messages"), list):
+                    messages = [ChatMessage.model_validate(item) for item in raw["messages"]]
+                elif isinstance(raw.get("prompt"), str) and isinstance(raw.get("completion"), str):
+                    messages = [
+                        ChatMessage(role="user", content=raw["prompt"]),
+                        ChatMessage(role="assistant", content=raw["completion"]),
+                    ]
+                else:
+                    raise ValueError(
+                        f"{label} line {line_number} needs messages or prompt/completion"
+                    )
+                if not messages or messages[-1].role != "assistant":
+                    raise ValueError(f"{label} line {line_number} must end with assistant")
+                rows.append(messages)
+            if not rows:
+                raise ValueError(f"{label} contains no rows")
+            datums: list[Datum] = []
+            template_digest: str | None = None
+            render_digests: list[str] = []
+            for messages in rows:
+                full = engine.render_chat(
+                    RenderChatRequest(
+                        messages=messages,
+                        tokenize=True,
+                        add_generation_prompt=False,
+                        enable_thinking=job.config.enable_thinking,
+                    )
                 )
-            )
-            prompt = engine.render_chat(
-                RenderChatRequest(
-                    messages=messages[:-1],
-                    tokenize=True,
-                    add_generation_prompt=True,
-                    enable_thinking=job.config.enable_thinking,
+                prompt = engine.render_chat(
+                    RenderChatRequest(
+                        messages=messages[:-1],
+                        tokenize=True,
+                        add_generation_prompt=True,
+                        enable_thinking=job.config.enable_thinking,
+                    )
                 )
-            )
-            if full.token_ids is None or prompt.token_ids is None:
-                raise RuntimeError("Qwen renderer did not return token IDs")
-            if full.template_digest != prompt.template_digest:
-                raise RuntimeError("SFT prompt and completion template digests differ")
-            if full.enable_thinking != prompt.enable_thinking:
-                raise RuntimeError("SFT prompt and completion thinking modes differ")
-            boundary = 0
-            for left, right in zip(prompt.token_ids, full.token_ids):
-                if left != right:
-                    break
-                boundary += 1
-            if boundary < max(1, len(prompt.token_ids) - 4):
-                raise ValueError("generation prompt and SFT completion lack a stable prefix")
-            weights = [
-                1.0 if target_index >= boundary else 0.0
-                for target_index in range(1, len(full.token_ids))
-            ]
-            datums.append(
-                Datum(
-                    input_ids=full.token_ids[:-1],
-                    target_ids=full.token_ids[1:],
-                    weights=weights,
-                    metadata={
-                        "render_digest": full.render_digest,
-                        "prompt_render_digest": prompt.render_digest,
-                        "template_digest": full.template_digest,
-                        "enable_thinking": full.enable_thinking,
-                    },
+                if full.token_ids is None or prompt.token_ids is None:
+                    raise RuntimeError("Qwen renderer did not return token IDs")
+                if (
+                    full.template_digest != prompt.template_digest
+                    or full.enable_thinking != prompt.enable_thinking
+                ):
+                    raise RuntimeError("SFT/eval prompt and completion render contracts differ")
+                boundary = 0
+                for left, right in zip(prompt.token_ids, full.token_ids):
+                    if left != right:
+                        break
+                    boundary += 1
+                if boundary < max(1, len(prompt.token_ids) - 4):
+                    raise ValueError("generation prompt and SFT completion lack a stable prefix")
+                weights = [
+                    1.0 if index >= boundary else 0.0 for index in range(1, len(full.token_ids))
+                ]
+                datums.append(
+                    Datum(
+                        input_ids=full.token_ids[:-1],
+                        target_ids=full.token_ids[1:],
+                        weights=weights,
+                        metadata={
+                            "render_digest": full.render_digest,
+                            "prompt_render_digest": prompt.render_digest,
+                            "template_digest": full.template_digest,
+                            "enable_thinking": full.enable_thinking,
+                        },
+                    )
                 )
+                template_digest = full.template_digest
+                render_digests.append(full.render_digest)
+            return datums, template_digest, render_digests
+
+        datums, template_digest, render_digests = render_dataset(
+            Path(job.config.dataset.path), "training dataset"
+        )
+        eval_datums = []
+        eval_render_digests: list[str] = []
+        if job.config.evaluation_dataset is not None:
+            eval_datums, eval_template_digest, eval_render_digests = render_dataset(
+                Path(job.config.evaluation_dataset.path), "evaluation dataset"
             )
-            template_digest = full.template_digest
-            render_digests.append(full.render_digest)
+            if eval_template_digest != template_digest:
+                raise RuntimeError("SFT and evaluation template digests differ")
 
         job.render_contract = {
             "template_digest": template_digest,
             "render_digests": render_digests,
+            "evaluation_render_digests": eval_render_digests,
             "enable_thinking": job.config.enable_thinking,
         }
         self.store.save_job(job)
+        baseline_losses = self._qwen_losses(engine, eval_datums) if eval_datums else []
         optimizer = AdamParams(
             learning_rate=job.config.learning_rate,
             weight_decay=0.0,
@@ -294,6 +309,75 @@ class TrainingRunner:
             if step % job.config.checkpoint_every == 0 or step == job.config.max_steps:
                 saved = engine.save_checkpoint(f"{job.job_id}-step-{step:06d}")
                 self._adapter_checkpoint(job.job_id, step, Path(saved.path))
+        if eval_datums:
+            trained_losses = self._qwen_losses(engine, eval_datums)
+            self._record_qwen_evaluation(job.job_id, baseline_losses, trained_losses)
+
+    @staticmethod
+    def _qwen_losses(engine: TrainingEngine, datums: list) -> list[float]:
+        losses = []
+        for datum in datums:
+            token_ids = [datum.input_ids[0], *datum.target_ids]
+            logprobs = engine.score_logprobs(token_ids, policy_snapshot_id=None)[1:]
+            weighted = [
+                (-float(value), weight)
+                for value, weight in zip(logprobs, datum.weights)
+                if value is not None and weight > 0
+            ]
+            if not weighted:
+                raise RuntimeError("evaluation item has no weighted assistant tokens")
+            losses.append(
+                sum(value * weight for value, weight in weighted)
+                / sum(weight for _, weight in weighted)
+            )
+        return losses
+
+    def _record_qwen_evaluation(self, job_id: str, before: list[float], after: list[float]) -> None:
+        if len(before) != len(after) or not before:
+            raise RuntimeError("paired evaluation outcomes are incomplete")
+        outcomes = [
+            {
+                "item": index,
+                "before_loss": left,
+                "after_loss": right,
+                "delta": right - left,
+                "improved": right < left,
+            }
+            for index, (left, right) in enumerate(zip(before, after))
+        ]
+        evaluation = {
+            "status": "completed",
+            "schema_version": "synth_mlx_rl.paired_evaluation.v1",
+            "items": outcomes,
+            "item_count": len(outcomes),
+            "mean_before_loss": sum(before) / len(before),
+            "mean_after_loss": sum(after) / len(after),
+            "mean_paired_delta": sum(right - left for left, right in zip(before, after))
+            / len(before),
+            "improved_items": sum(item["improved"] for item in outcomes),
+            "baseline_policy": "resident_policy_at_job_start",
+            "mcnemar": {
+                "applicable": False,
+                "reason": (
+                    "held-out outcome is continuous token loss, not paired binary correctness"
+                ),
+            },
+        }
+        job = self.store.load_job(job_id)
+        if job.config.evaluation_dataset is not None:
+            evaluation["dataset_sha256"] = sha256_file(Path(job.config.evaluation_dataset.path))
+        output = Path(job.config.output_dir) / "evaluation.json"
+        output.write_text(json.dumps(evaluation, indent=2, sort_keys=True))
+        evaluation["path"] = str(output)
+        evaluation["sha256"] = sha256_file(output)
+        job.evaluation = evaluation
+        job.updated_at = utc_now()
+        self.store.save_job(job)
+        self.store.append_event(
+            job_id,
+            "evaluation.completed",
+            {"item_count": len(outcomes), "sha256": evaluation["sha256"]},
+        )
 
     def _adapter_checkpoint(self, job_id: str, step: int, path: Path) -> Checkpoint:
         required = [

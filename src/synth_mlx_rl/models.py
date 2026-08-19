@@ -48,6 +48,7 @@ class TrainingConfig(BaseModel):
     backend: Literal["fixture", "mlx_scalar_smoke", "qwen_lora"] = "fixture"
     base_model: str = "Qwen/Qwen3.5-0.8B"
     dataset: DatasetSpec
+    evaluation_dataset: DatasetSpec | None = None
     output_dir: str
     max_steps: int = Field(default=4, ge=1, le=10_000)
     checkpoint_every: int = Field(default=1, ge=1, le=10_000)
@@ -108,6 +109,7 @@ class Job(BaseModel):
     resume_supported: bool = False
     recovery: Literal["reopen", "restart_from_checkpoint_unsupported"] = "reopen"
     render_contract: dict[str, object] = Field(default_factory=dict)
+    evaluation: dict[str, object] = Field(default_factory=dict)
 
 
 class Capability(BaseModel):
@@ -139,4 +141,4 @@ class Handoff(BaseModel):
     checkpoint: Checkpoint
     inference: dict[str, str]
     provenance: dict[str, str]
-    evaluation: dict[str, str]
+    evaluation: dict[str, object]

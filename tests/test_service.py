@@ -56,6 +56,17 @@ def test_preflight_rejects_missing_dataset(tmp_path: Path) -> None:
     assert client.post("/v1/jobs", json=payload).status_code == 422
 
 
+def test_preflight_rejects_dataset_digest_mismatch(tmp_path: Path) -> None:
+    client = TestClient(create_app(tmp_path / "service"))
+    payload = _payload(tmp_path)
+    payload["config"]["dataset"]["sha256"] = "0" * 64  # type: ignore[index]
+
+    preflight = client.post("/v1/jobs/preflight", json=payload).json()
+
+    assert preflight["accepted"] is False
+    assert "does not match" in preflight["checks"]["dataset"]["reason"]
+
+
 def test_fixture_job_has_live_metrics_terminal_digest_and_durable_handoff(tmp_path: Path) -> None:
     root = tmp_path / "service"
     client = TestClient(create_app(root))
@@ -167,12 +178,17 @@ def test_qwen_lora_job_persists_real_adapter_contract_and_render_lineage(
         '{"messages":[{"role":"user","content":"Say ready"},'
         '{"role":"assistant","content":"READY"}]}\n'
     )
+    evaluation_dataset = tmp_path / "qwen-eval.jsonl"
+    evaluation_dataset.write_text(
+        '{"prompt":"Reply yes","completion":"yes"}\n{"prompt":"Reply no","completion":"no"}\n'
+    )
     payload = {
         "job_id": "qwen-lora",
         "config": {
             "backend": "qwen_lora",
             "base_model": "Qwen/Qwen3.5-0.8B",
             "dataset": {"path": str(dataset)},
+            "evaluation_dataset": {"path": str(evaluation_dataset)},
             "output_dir": str(tmp_path / "qwen-output"),
             "max_steps": 2,
             "checkpoint_every": 2,
@@ -203,12 +219,18 @@ def test_qwen_lora_job_persists_real_adapter_contract_and_render_lineage(
         assert job["status"] == "succeeded"
         assert job["render_contract"]["enable_thinking"] is False
         assert job["render_contract"]["template_digest"]
+        assert len(job["render_contract"]["evaluation_render_digests"]) == 2
+        assert job["evaluation"]["status"] == "completed"
+        assert job["evaluation"]["item_count"] == 2
+        assert len(job["evaluation"]["items"]) == 2
+        assert job["evaluation"]["mcnemar"]["applicable"] is False
         checkpoint = Path(job["checkpoints"][-1]["path"])
         assert (checkpoint / "adapter_config.json").is_file()
         assert (checkpoint / "adapters.safetensors").is_file()
         handoff = client.get("/v1/jobs/qwen-lora/handoff").json()
         assert handoff["inference"]["kind"] == "mlx-lora.v1"
         assert handoff["checkpoint"]["sha256"] == job["checkpoints"][-1]["sha256"]
+        assert handoff["evaluation"]["status"] == "completed"
 
 
 def test_qwen_preflight_fails_closed_on_resident_render_contract_mismatch(
@@ -227,9 +249,7 @@ def test_qwen_preflight_fails_closed_on_resident_render_contract_mismatch(
             "enable_thinking": False,
         }
     )
-    with TestClient(
-        create_app(tmp_path / "service", settings=settings, engine=engine)
-    ) as client:
+    with TestClient(create_app(tmp_path / "service", settings=settings, engine=engine)) as client:
         preflight = client.post("/v1/jobs/preflight", json=payload).json()
     assert preflight["accepted"] is False
     assert "do not match the resident service" in preflight["checks"]["backend"]["reason"]

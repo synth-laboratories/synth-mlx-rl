@@ -112,10 +112,35 @@ class LocalTrainingService:
         dataset = Path(config.dataset.path).expanduser()
         if dataset.is_file():
             dataset_digest = sha256_file(dataset)
-            checks["dataset"] = Capability(supported=True)
+            digest_matches = config.dataset.sha256 in {None, dataset_digest}
+            checks["dataset"] = Capability(
+                supported=digest_matches,
+                reason=None if digest_matches else "dataset sha256 does not match file bytes",
+            )
         else:
             dataset_digest = None
             checks["dataset"] = Capability(supported=False, reason="dataset path is not a file")
+        if config.evaluation_dataset is not None:
+            evaluation_dataset = Path(config.evaluation_dataset.path).expanduser()
+            evaluation_digest = (
+                sha256_file(evaluation_dataset) if evaluation_dataset.is_file() else None
+            )
+            evaluation_matches = config.evaluation_dataset.sha256 in {
+                None,
+                evaluation_digest,
+            }
+            checks["evaluation_dataset"] = Capability(
+                supported=evaluation_dataset.is_file() and evaluation_matches,
+                reason=(
+                    None
+                    if evaluation_dataset.is_file() and evaluation_matches
+                    else (
+                        "evaluation dataset sha256 does not match file bytes"
+                        if evaluation_dataset.is_file()
+                        else "evaluation dataset path is not a file"
+                    )
+                ),
+            )
         output = Path(config.output_dir).expanduser()
         output_parent = output if output.is_dir() else output.parent
         while not output_parent.exists() and output_parent != output_parent.parent:
@@ -320,6 +345,16 @@ def create_app(
             raise HTTPException(status_code=409, detail="no checkpoint is available")
         checkpoint = job.checkpoints[-1]
         qwen_lora = job.config.backend == "qwen_lora"
+        evaluation = dict(job.evaluation)
+        if "status" not in evaluation:
+            evaluation.update(
+                status="not_run",
+                reason=(
+                    "evaluation dataset was not configured"
+                    if qwen_lora
+                    else "fixture/smoke backends do not create a deployable model"
+                ),
+            )
         return Handoff(
             job_id=job_id,
             checkpoint=checkpoint,
@@ -333,14 +368,7 @@ def create_app(
                 "dataset_sha256": job.dataset_sha256,
                 "render_contract": canonical_json(job.render_contract).decode(),
             },
-            evaluation={
-                "status": "not_run",
-                "reason": (
-                    "real adapter persisted; evaluation must be recorded separately"
-                    if qwen_lora
-                    else "fixture/smoke backends do not create a deployable model"
-                ),
-            },
+            evaluation=evaluation,
         )
 
     return app
