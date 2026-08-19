@@ -127,7 +127,11 @@ class JobStore:
                 job.status = JobStatus.INTERRUPTED
                 job.error_code = "service_restarted"
                 job.error_detail = (
-                    "The service restarted; automatic resume is unsupported for this backend."
+                    "The service restarted mid-run. Resume from the last checkpoint with "
+                    "POST /v1/jobs/{job_id}/resume, or leave it terminal."
+                    if job.checkpoints
+                    else "The service restarted before any checkpoint was written; there is "
+                    "nothing to resume from."
                 )
                 job.finished_at = utc_now()
                 job.updated_at = job.finished_at

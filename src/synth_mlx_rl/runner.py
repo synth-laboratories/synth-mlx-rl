@@ -120,6 +120,48 @@ class TrainingRunner:
             thread.start()
             return job
 
+    def resume(self, job_id: str) -> Job:
+        """Continue an interrupted or cancelled job from its last checkpoint.
+
+        The engine restores the adapter weights, the Adam moments and the step
+        counter together -- resuming weights without the optimizer state would
+        silently restart the moment estimates and change the trajectory while
+        looking like a continuation.
+        """
+
+        with self._lock:
+            job = self.store.load_job(job_id)
+            if job.status not in {JobStatus.INTERRUPTED, JobStatus.CANCELLED}:
+                raise ValueError(
+                    f"job {job_id} is {job.status}; only interrupted or cancelled jobs resume"
+                )
+            if not job.checkpoints:
+                raise ValueError("job has no checkpoint to resume from")
+            if job.current_step >= job.config.max_steps:
+                raise ValueError("job already reached max_steps; there is nothing to resume")
+            cancel = threading.Event()
+            self._cancel[job_id] = cancel
+            job.status = JobStatus.QUEUED
+            job.error_code = None
+            job.error_detail = None
+            job.finished_at = None
+            job.updated_at = utc_now()
+            self.store.save_job(job)
+            self.store.append_event(
+                job_id,
+                "job.resumed",
+                {"from_step": job.current_step, "checkpoint": job.checkpoints[-1].checkpoint_id},
+            )
+            thread = threading.Thread(
+                target=self._run,
+                args=(job_id, cancel, True),
+                daemon=True,
+                name=f"mlx-job-{job_id}",
+            )
+            self._threads[job_id] = thread
+            thread.start()
+            return job
+
     def cancel(self, job_id: str) -> Job:
         with self._lock:
             job = self.store.load_job(job_id)
@@ -140,17 +182,19 @@ class TrainingRunner:
             self.store.append_event(job_id, "job.cancellation_requested")
             return job
 
-    def _run(self, job_id: str, cancelled: threading.Event) -> None:
+    def _run(self, job_id: str, cancelled: threading.Event, resuming: bool = False) -> None:
         job = self.store.load_job(job_id)
         job.status = JobStatus.RUNNING
         job.started_at = utc_now()
         job.updated_at = job.started_at
         self.store.save_job(job)
-        self.store.append_event(job_id, "job.started", {"backend": job.config.backend})
+        self.store.append_event(
+            job_id, "job.started", {"backend": job.config.backend, "resumed": resuming}
+        )
         try:
             if job.config.backend != "qwen_lora":  # pydantic validates before persistence
                 raise RuntimeError(f"unsupported backend {job.config.backend}")
-            self._run_qwen_lora(job, cancelled)
+            self._run_qwen_lora(job, cancelled, resuming)
             job = self.store.load_job(job_id)
             job.status = JobStatus.SUCCEEDED
             job.finished_at = utc_now()
@@ -178,7 +222,9 @@ class TrainingRunner:
             self.store.save_job(job)
             self.store.append_event(job_id, "job.failed", {"error_code": job.error_code})
 
-    def _run_qwen_lora(self, job: Job, cancelled: threading.Event) -> None:
+    def _run_qwen_lora(
+        self, job: Job, cancelled: threading.Event, resuming: bool = False
+    ) -> None:
         """Bounded real Qwen LoRA SFT through the resident MLX engine."""
         if self._engine_provider is None:
             raise RuntimeError("the resident Qwen MLX engine is not available")
@@ -287,7 +333,23 @@ class TrainingRunner:
             "enable_thinking": job.config.enable_thinking,
         }
         self.store.save_job(job)
-        baseline_losses = self._qwen_losses(engine, eval_datums) if eval_datums else []
+
+        if resuming:
+            # Weights, Adam moments and the step counter come back together.
+            checkpoint = Path(job.checkpoints[-1].path)
+            engine.load_checkpoint(checkpoint.name)
+            baseline_losses = [float(value) for value in job.evaluation.get("baseline_losses", [])]
+            start_step = job.current_step + 1
+        else:
+            # The baseline is scored before the first update and persisted, so a
+            # resumed run compares against the same untrained model rather than
+            # re-scoring one that has already moved.
+            baseline_losses = self._qwen_losses(engine, eval_datums) if eval_datums else []
+            job = self.store.load_job(job.job_id)
+            job.evaluation = {**job.evaluation, "baseline_losses": baseline_losses}
+            self.store.save_job(job)
+            start_step = 1
+
         optimizer = AdamParams(
             learning_rate=job.config.learning_rate,
             weight_decay=0.0,
@@ -299,7 +361,11 @@ class TrainingRunner:
             shuffle=job.config.shuffle,
             seed=job.config.seed,
         )
-        for step in range(1, job.config.max_steps + 1):
+        # The stream is deterministic in `seed`, so replaying it to the resume
+        # point reproduces the exact batch order rather than persisting it.
+        for _ in range(start_step - 1):
+            batches.next_batch()
+        for step in range(start_step, job.config.max_steps + 1):
             self._cancel_boundary(cancelled)
             started = time.monotonic()
             indices = batches.next_batch()
@@ -422,6 +488,8 @@ class TrainingRunner:
         )
         job = self.store.load_job(job_id)
         job.checkpoints.append(checkpoint)
+        job.resume_supported = True
+        job.recovery = "resume_from_checkpoint"
         job.updated_at = utc_now()
         self.store.save_job(job)
         self.store.append_event(

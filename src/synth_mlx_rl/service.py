@@ -124,9 +124,13 @@ class LocalTrainingService:
                         else "Qwen LoRA requires Apple Silicon, mlx, and mlx-lm"
                     ),
                 ),
-                "automatic_resume": Capability(
-                    supported=False,
-                    reason="optimizer state is not yet durable",
+                "resume_from_checkpoint": Capability(
+                    supported=qwen_available,
+                    reason=(
+                        None
+                        if qwen_available
+                        else "resume needs the same engine that wrote the checkpoint"
+                    ),
                 ),
                 "tinker_training_subset": Capability(
                     supported=False,
@@ -351,6 +355,15 @@ def create_app(
     def launch(job_id: str) -> Job:
         try:
             return service.runner.launch(job_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="job not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/v1/jobs/{job_id}/resume", response_model=Job, status_code=202)
+    def resume(job_id: str) -> Job:
+        try:
+            return service.runner.resume(job_id)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="job not found") from exc
         except ValueError as exc:

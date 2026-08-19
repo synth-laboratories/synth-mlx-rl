@@ -34,3 +34,15 @@ def client(app):
 
     with TestClient(app) as test_client:
         yield test_client
+
+
+@pytest.fixture
+def engine(client):
+    """The live engine behind the running app.
+
+    Bound during the app lifespan, so it is reached through a started client
+    rather than constructed separately -- there is exactly one resident model
+    and tests share it.
+    """
+
+    return client.app.state.engine

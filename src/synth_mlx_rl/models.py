@@ -127,8 +127,13 @@ class Job(BaseModel):
     metrics_path: str
     events_path: str
     manifest_path: str
+    #: True once a checkpoint exists: the engine persists adapter weights, the
+    #: Adam moments and the step, so a resumed run continues rather than
+    #: restarting. It is not bit-exact when `lora_dropout > 0`, because the MLX
+    #: RNG stream is not persisted -- with the default dropout of 0.0 that has
+    #: no effect on the update.
     resume_supported: bool = False
-    recovery: Literal["reopen", "restart_from_checkpoint_unsupported"] = "reopen"
+    recovery: Literal["reopen", "resume_from_checkpoint"] = "reopen"
     render_contract: dict[str, object] = Field(default_factory=dict)
     evaluation: dict[str, object] = Field(default_factory=dict)
 

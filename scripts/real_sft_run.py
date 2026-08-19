@@ -127,6 +127,11 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=8787)
     parser.add_argument("--root", type=Path, default=Path(".real-sft-run"))
     parser.add_argument("--keep", action="store_true", help="leave the service running")
+    parser.add_argument(
+        "--prove-resume",
+        action="store_true",
+        help="cancel mid-run and resume, asserting the run continues rather than restarting",
+    )
     args = parser.parse_args()
 
     admit()
@@ -199,6 +204,33 @@ def main() -> int:
         status, job = request("POST", f"{base}/v1/jobs/real-sft/launch")
         assert status == 202, job
 
+        if args.prove_resume:
+            # Cancel once a checkpoint exists, then resume. A run that restarted
+            # would repeat step 1 and its loss would jump back up.
+            deadline = time.monotonic() + 900
+            while time.monotonic() < deadline:
+                _, job = request("GET", f"{base}/v1/jobs/real-sft")
+                if job["checkpoints"] and job["current_step"] >= 2:
+                    break
+                if job["status"] in {"succeeded", "failed"}:
+                    raise Refused("job finished before it could be interrupted")
+                time.sleep(0.5)
+            request("POST", f"{base}/v1/jobs/real-sft/cancel")
+            while True:
+                _, job = request("GET", f"{base}/v1/jobs/real-sft")
+                if job["status"] in {"cancelled", "succeeded", "failed"}:
+                    break
+                time.sleep(0.5)
+            if job["status"] != "cancelled":
+                raise Refused(f"expected cancelled, got {job['status']}")
+            interrupted_at = job["current_step"]
+            if not job["resume_supported"]:
+                raise Refused("a job with a checkpoint must report resume_supported")
+            print(f"cancelled at step {interrupted_at}; resuming")
+            status, job = request("POST", f"{base}/v1/jobs/real-sft/resume")
+            if status != 202:
+                raise Refused(f"resume refused: {status} {job}")
+
         seen = 0
         deadline = time.monotonic() + 1800
         while time.monotonic() < deadline:
@@ -226,6 +258,23 @@ def main() -> int:
 
         if job["status"] != "succeeded":
             raise Refused(f"job {job['status']}: {job.get('error_detail')}")
+
+        if args.prove_resume:
+            _, page = request("GET", f"{base}/v1/jobs/real-sft/events?after=0")
+            metrics = [e["payload"] for e in page["events"] if e["type"] == "training.metric"]
+            steps = [m["step"] for m in metrics]
+            if steps != sorted(set(steps)) or len(steps) != args.steps:
+                raise Refused(f"resumed run did not cover each step exactly once: {steps}")
+            resumed = next(m for m in metrics if m["step"] == interrupted_at + 1)
+            before = next(m for m in metrics if m["step"] == interrupted_at)
+            print(
+                f"resume seam: step {before['step']} loss={before['loss']:.4f} -> "
+                f"step {resumed['step']} loss={resumed['loss']:.4f}"
+            )
+            if resumed["loss"] > before["loss"]:
+                raise Refused(
+                    "loss rose across the resume seam -- optimizer state was not carried"
+                )
 
         status, handoff = request("GET", f"{base}/v1/jobs/real-sft/handoff")
         assert status == 200, handoff
