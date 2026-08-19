@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "synth-mlx-rl"
-version = "0.0.1"
+version = "0.6.0"
 description = "Native reinforcement learning for Apple MLX, with a Tinker-compatible API."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -21,6 +21,24 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
   "Typing :: Typed",
 ]
+dependencies = [
+  "fastapi>=0.115",
+  "pydantic>=2.10",
+  "uvicorn>=0.34",
+]
+
+[project.optional-dependencies]
+mlx = [
+  "mlx>=0.30; platform_system == 'Darwin' and platform_machine == 'arm64'",
+]
+dev = [
+  "httpx>=0.28",
+  "pytest>=8",
+  "ruff>=0.9",
+]
+
+[project.scripts]
+synth-mlx-rl = "synth_mlx_rl.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/synth-laboratories/synth-mlx-rl"
@@ -29,3 +47,16 @@ Issues = "https://github.com/synth-laboratories/synth-mlx-rl/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/synth_mlx_rl"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "mlx: requires the optional MLX runtime on macOS Apple Silicon",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]

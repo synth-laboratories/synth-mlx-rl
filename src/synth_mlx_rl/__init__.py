@@ -1,4 +1,3 @@
-"""Native reinforcement learning for Apple MLX."""
+"""Durable local Apple-silicon training service for Workshop v0.6."""
 
-__version__ = "0.0.1"
-
+__version__ = "0.6.0"
