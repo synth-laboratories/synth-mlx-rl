@@ -11,3 +11,6 @@ Found the latest cached dataset configuration 'main' at /Users/joshuapurtell/.ca
 collecting: 48 train prompts x 16 samples, temp=0.8
   16/48 prompts, 111/256 accepted (375s)
   32/48 prompts, 250/512 accepted (783s)
+  48/48 prompts, 387/768 accepted (1170s)
+  accepted 387/768 traces (50.4%)
+  cached -> runs/traces_hi.jsonl
