@@ -17,7 +17,7 @@ def test_both_api_families_are_mounted(client) -> None:
     assert "/v1/responses" in paths
 
 
-def test_end_to_end_fake_protocol(client) -> None:
+def test_end_to_end_protocol(client) -> None:
     health = client.get("/healthz")
     assert health.status_code == 200
     assert health.json()["ok"] is True
@@ -41,7 +41,12 @@ def test_end_to_end_fake_protocol(client) -> None:
     )
 
     logprobs = client.post("/v1/synth/logprobs", json={"token_ids": [1, 2, 3]})
-    assert logprobs.json()["logprobs"] == [None, -0.25, -0.25]
+    scored = logprobs.json()["logprobs"]
+    # The first token has no predecessor to be scored against, and the rest are
+    # real log-probabilities. Their values belong to the model, not to this test.
+    assert scored[0] is None
+    assert len(scored) == 3
+    assert all(isinstance(value, float) and value < 0 for value in scored[1:])
 
     datum = {"input_ids": [1, 2, 3], "target_ids": [2, 3, 4], "weights": [0.0, 1.0, 1.0]}
     forward = client.post(

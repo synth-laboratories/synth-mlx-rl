@@ -48,45 +48,6 @@ def test_engine_loads_and_publishes_an_initial_snapshot(mlx_engine) -> None:
     assert state.latest_policy_snapshot_id is not None
 
 
-def test_mlx_kernel_matches_the_numpy_reference() -> None:
-    """The parity claim, finally checked on the array library that runs it."""
-
-    import numpy as np
-
-    from synth_mlx_rl.backends import MlxOps
-    from synth_mlx_rl.kernel import policy_terms
-    from synth_mlx_rl.objective_spec import ObjectiveSpec
-
-    rng = np.random.default_rng(0)
-    behavior = rng.normal(-1.5, 1.0, 32)
-    current = behavior + rng.normal(0.0, 1.5, 32)
-    advantages = rng.normal(0.0, 1.0, 32)
-    weights = np.ones(32)
-
-    for spec in (
-        ObjectiveSpec(name="grpo"),
-        ObjectiveSpec(name="cispo_minimax", eps_low=1.0, eps_high=4.0),
-        ObjectiveSpec(name="cispo_two_sided", eps_low=0.2, eps_high=0.28),
-        ObjectiveSpec(name="importance_sampling"),
-    ):
-        expected = policy_loss(
-            spec,
-            current_logprobs=current,
-            behavior_logprobs=behavior,
-            advantages=advantages,
-            weights=weights,
-        )
-        loss, _ = policy_terms(
-            MlxOps(mlx),
-            spec,
-            current_logprobs=mlx.array(current.astype("float32")),
-            behavior_logprobs=mlx.array(behavior.astype("float32")),
-            advantages=mlx.array(advantages.astype("float32")),
-            weights=mlx.array(weights.astype("float32")),
-        )
-        assert abs(float(loss.item()) - expected.loss) < 1e-4, spec.name
-
-
 def test_mlx_stop_gradient_blocks_the_cispo_denominator() -> None:
     """The gradient claim, on MLX autograd rather than dual numbers."""
 

@@ -112,7 +112,7 @@ def test_mismatch_closes_the_lifecycle_in_one_round_trip(client) -> None:
     sampled = client.post(
         "/v1/chat/completions",
         json={
-            "model": "fake/Qwen3.5-0.8B",
+            "model": "Qwen/Qwen3.5-0.8B",
             "messages": [{"role": "user", "content": "hello"}],
             "max_tokens": 8,
         },
@@ -161,7 +161,7 @@ def test_mismatch_thresholds_are_caller_settable(client) -> None:
     sampled = client.post(
         "/v1/chat/completions",
         json={
-            "model": "fake/Qwen3.5-0.8B",
+            "model": "Qwen/Qwen3.5-0.8B",
             "messages": [{"role": "user", "content": "hi"}],
             "max_tokens": 4,
         },
