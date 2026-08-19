@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import random
 import threading
+import time
 from pathlib import Path
 from typing import Callable, Protocol
 
@@ -17,6 +19,44 @@ class TrainingEngine(Protocol):
     def optim_step(self, params): ...
     def save_checkpoint(self, name: str): ...
     def score_logprobs(self, token_ids: list[int], *, policy_snapshot_id: str | None = None): ...
+
+
+class _MinibatchStream:
+    """Shuffled minibatches that wrap around the dataset, counting epochs.
+
+    A batch may straddle an epoch boundary; the tail of one shuffle is followed
+    by the head of the next rather than being dropped or padded, so every row
+    is seen the same number of times regardless of how the batch size divides
+    the dataset.
+    """
+
+    def __init__(self, *, count: int, batch_size: int, shuffle: bool, seed: int) -> None:
+        if count <= 0:
+            raise ValueError("cannot build minibatches from an empty dataset")
+        self._count = count
+        self._batch_size = batch_size
+        self._shuffle = shuffle
+        self._random = random.Random(seed)
+        self._order = list(range(count))
+        self.epoch = 1
+        self._cursor = 0
+        self._reshuffle()
+
+    def _reshuffle(self) -> None:
+        if self._shuffle:
+            self._random.shuffle(self._order)
+
+    def next_batch(self) -> list[int]:
+        batch: list[int] = []
+        while len(batch) < self._batch_size:
+            if self._cursor >= self._count:
+                self.epoch += 1
+                self._cursor = 0
+                self._reshuffle()
+            take = min(self._batch_size - len(batch), self._count - self._cursor)
+            batch.extend(self._order[self._cursor : self._cursor + take])
+            self._cursor += take
+        return batch
 
 
 def _mlx_peak_memory() -> int | None:
@@ -253,17 +293,41 @@ class TrainingRunner:
             weight_decay=0.0,
             max_grad_norm=1.0,
         )
+        batches = _MinibatchStream(
+            count=len(datums),
+            batch_size=job.config.batch_size,
+            shuffle=job.config.shuffle,
+            seed=job.config.seed,
+        )
         for step in range(1, job.config.max_steps + 1):
             self._cancel_boundary(cancelled)
-            forward = engine.forward_backward(
-                ForwardBackwardRequest(data=datums, loss_fn="cross_entropy")
-            )
+            started = time.monotonic()
+            indices = batches.next_batch()
+            batch = [datums[index] for index in indices]
+            # One optimizer step, however many forward passes it takes. The
+            # engine accumulates each pass weighted by its own unmasked-token
+            # count and divides by the summed weight at optim_step, so the
+            # result is one mean over every token in the batch -- splitting for
+            # memory does not change the update.
+            weighted_loss = 0.0
+            tokens = 0.0
+            for start in range(0, len(batch), job.config.micro_batch_size):
+                self._cancel_boundary(cancelled)
+                micro = batch[start : start + job.config.micro_batch_size]
+                forward = engine.forward_backward(
+                    ForwardBackwardRequest(data=micro, loss_fn="cross_entropy")
+                )
+                micro_tokens = float(forward.metrics.get("token_count", 0.0))
+                weighted_loss += float(forward.loss) * micro_tokens
+                tokens += micro_tokens
             engine.optim_step(optimizer)
             self._record_step(
                 job.job_id,
                 step,
-                loss=forward.loss,
-                throughput=float(forward.metrics.get("token_count", 0.0)),
+                loss=weighted_loss / tokens if tokens else 0.0,
+                tokens=tokens,
+                seconds=time.monotonic() - started,
+                epoch=batches.epoch,
                 memory=_mlx_peak_memory(),
             )
             if step % job.config.checkpoint_every == 0 or step == job.config.max_steps:
@@ -378,7 +442,9 @@ class TrainingRunner:
         step: int,
         *,
         loss: float,
-        throughput: float,
+        tokens: float,
+        seconds: float,
+        epoch: int,
         memory: int | None,
     ) -> None:
         job = self.store.load_job(job_id)
@@ -387,9 +453,16 @@ class TrainingRunner:
         self.store.save_job(job)
         metric: dict[str, object] = {
             "step": step,
+            "epoch": epoch,
             "loss": loss,
             "learning_rate": job.config.learning_rate,
-            "throughput_steps_per_second": throughput,
+            # Tokens and seconds, then the rate derived from them. The previous
+            # field was named `throughput_steps_per_second` and carried a token
+            # count, which is the kind of instrument that reads plausibly and
+            # says nothing true.
+            "tokens": tokens,
+            "step_seconds": seconds,
+            "tokens_per_second": tokens / seconds if seconds > 0 else 0.0,
             "memory_bytes": memory,
             "timestamp": utc_now(),
         }

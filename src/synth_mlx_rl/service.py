@@ -28,6 +28,54 @@ def _memory_bytes() -> int | None:
         return None
 
 
+def _available_memory_bytes() -> int | None:
+    """Memory the allocator could actually get, not total installed."""
+
+    if platform.system() != "Darwin":
+        return None
+    try:
+        out = os.popen("vm_stat").read()
+    except OSError:
+        return None
+    page = 4096
+    reclaimable = 0
+    for line in out.splitlines():
+        if "page size of" in line:
+            page = int(line.split("page size of")[1].split("bytes")[0].strip())
+        key, _, value = line.partition(":")
+        value = value.strip().rstrip(".")
+        if key.strip() in {"Pages free", "Pages inactive", "Pages speculative"} and value.isdigit():
+            reclaimable += int(value)
+    return reclaimable * page or None
+
+
+#: Peak MLX allocation is approximately linear in the tokens of a single
+#: forward/backward pass. Fitted on this backend with gradient checkpointing on,
+#: Qwen3.5-0.8B rank-8: 758 tokens -> 15.54 GB, 3090 tokens -> 57.61 GB. That is
+#: 18.0 MB per token over a 1.9 GB resident floor. Without checkpointing the
+#: slope is roughly 42 MB/token, which is why it is not optional here.
+PEAK_BYTES_PER_TOKEN = 18_000_000
+RESIDENT_FLOOR_BYTES = 1_900_000_000
+#: Leave the machine able to do something other than swap.
+MEMORY_HEADROOM_BYTES = 4 * 1024**3
+#: Rough bytes-per-token for chat text. Only used to size a refusal, and the
+#: estimate is reported so a caller can see what it was refused on.
+BYTES_PER_TOKEN_ESTIMATE = 3.5
+
+
+def estimated_peak_bytes(*, dataset_bytes: int, rows: int, micro_batch_size: int,
+                         max_seq_length: int) -> int:
+    """What one forward/backward over a micro-batch is expected to peak at."""
+
+    if rows <= 0:
+        return RESIDENT_FLOOR_BYTES
+    tokens_per_row = min(
+        float(max_seq_length), (dataset_bytes / rows) / BYTES_PER_TOKEN_ESTIMATE
+    )
+    tokens = tokens_per_row * min(micro_batch_size, rows)
+    return int(RESIDENT_FLOOR_BYTES + PEAK_BYTES_PER_TOKEN * tokens)
+
+
 class LocalTrainingService:
     def __init__(
         self,
@@ -142,6 +190,37 @@ class LocalTrainingService:
         checks["disk"] = Capability(
             supported=free >= disk_needed,
             reason=None if free >= disk_needed else f"need {disk_needed} bytes; have {free}",
+        )
+        # Memory, not disk, is what actually ends a run on this hardware, and it
+        # scales with the tokens in one forward pass -- so it is a function of
+        # micro_batch_size, never of dataset size. A full-batch config that would
+        # peak past the machine is refused here rather than discovered by
+        # watching the allocator thrash.
+        rows = 0
+        dataset_bytes = 0
+        if dataset.is_file():
+            dataset_bytes = dataset.stat().st_size
+            rows = sum(1 for line in dataset.read_text(encoding="utf-8").splitlines() if line.strip())
+        estimated = estimated_peak_bytes(
+            dataset_bytes=dataset_bytes,
+            rows=rows,
+            micro_batch_size=config.micro_batch_size,
+            max_seq_length=config.max_seq_length,
+        )
+        available = _available_memory_bytes()
+        budget = None if available is None else available - MEMORY_HEADROOM_BYTES
+        checks["memory"] = Capability(
+            supported=budget is None or estimated <= budget,
+            reason=(
+                None
+                if budget is None or estimated <= budget
+                else (
+                    f"a micro-batch of {config.micro_batch_size} row(s) is estimated to peak at "
+                    f"{estimated / 1024**3:.1f} GB, and only {available / 1024**3:.1f} GB is "
+                    f"available. Lower micro_batch_size -- batch_size can stay where it is, "
+                    f"because accumulation makes them independent."
+                )
+            ),
         )
         capability = self.capabilities().capabilities["qwen_lora_training"]
         if config.base_model != "Qwen/Qwen3.5-0.8B":

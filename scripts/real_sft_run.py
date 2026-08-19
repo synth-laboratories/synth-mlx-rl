@@ -122,6 +122,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--rows", type=int, default=8)
     parser.add_argument("--steps", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--micro-batch-size", type=int, default=1)
     parser.add_argument("--port", type=int, default=8787)
     parser.add_argument("--root", type=Path, default=Path(".real-sft-run"))
     parser.add_argument("--keep", action="store_true", help="leave the service running")
@@ -135,9 +137,10 @@ def main() -> int:
 
     # A task with a rule the base model does not already follow, so a paired
     # before/after score is capable of moving at all.
-    pairs = [(f"echo {word}", f"<{word.upper()}>") for word in
-             ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
-              "india", "juliett", "kilo", "lima"]]
+    words = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+             "india", "juliett", "kilo", "lima", "mike", "november", "oscar", "papa"]
+    pairs = [(f"echo {words[i % len(words)]}-{i}", f"<{words[i % len(words)].upper()}-{i}>")
+             for i in range(args.rows + 4)]
     train = write_dataset(root / "train.jsonl", pairs[: args.rows])
     heldout = write_dataset(root / "heldout.jsonl", pairs[args.rows : args.rows + 4])
 
@@ -172,6 +175,9 @@ def main() -> int:
                 "evaluation_dataset": {"path": str(heldout)},
                 "output_dir": str(root / "output"),
                 "max_steps": args.steps,
+                "batch_size": args.batch_size,
+                "micro_batch_size": args.micro_batch_size,
+                "shuffle": True,
                 "checkpoint_every": max(1, args.steps // 2),
                 "learning_rate": 1e-4,
                 "lora_rank": contract["lora_rank"],
@@ -204,7 +210,10 @@ def main() -> int:
                 if event["type"] == "training.metric":
                     metric = event["payload"]
                     print(
-                        f"  step {metric['step']}  loss={metric['loss']:.4f}  "
+                        f"  step {metric['step']} (epoch {metric['epoch']})  "
+                        f"loss={metric['loss']:.4f}  "
+                        f"{metric['tokens']:.0f} tok in {metric['step_seconds']:.1f}s "
+                        f"= {metric['tokens_per_second']:.0f} tok/s  "
                         f"peak={(metric.get('memory_bytes') or 0) / 1024**3:.2f} GB"
                     )
                 elif event["type"] not in {"training.metric"}:

@@ -10,7 +10,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class JobStatus(StrEnum):
@@ -52,7 +52,17 @@ class TrainingConfig(BaseModel):
     dataset: DatasetSpec
     evaluation_dataset: DatasetSpec | None = None
     output_dir: str
+    #: One step is one optimizer update over `batch_size` rows. The rows are
+    #: fed to the engine `micro_batch_size` at a time and their gradients are
+    #: accumulated, so batch size is a *statistical* choice and micro-batch size
+    #: is a *memory* one. They are separate knobs because peak memory scales
+    #: with the tokens in a single forward pass, not with the update size.
     max_steps: int = Field(default=4, ge=1, le=10_000)
+    batch_size: int = Field(default=8, ge=1, le=8192)
+    micro_batch_size: int = Field(default=1, ge=1, le=1024)
+    #: Reshuffled every epoch from `seed`. Off means the dataset order is the
+    #: gradient order, which correlates consecutive updates.
+    shuffle: bool = True
     checkpoint_every: int = Field(default=1, ge=1, le=10_000)
     learning_rate: float = Field(default=0.01, gt=0, le=1)
     lora_rank: int = Field(default=8, ge=1, le=256)
@@ -68,6 +78,15 @@ class TrainingConfig(BaseModel):
         if not value.strip():
             raise ValueError("output_dir must not be empty")
         return value
+
+    @model_validator(mode="after")
+    def micro_batch_fits_in_batch(self) -> "TrainingConfig":
+        if self.micro_batch_size > self.batch_size:
+            raise ValueError(
+                "micro_batch_size must not exceed batch_size: a micro-batch is a "
+                "slice of one update, not a larger one"
+            )
+        return self
 
 
 class ConfigureRequest(BaseModel):
