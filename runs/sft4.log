@@ -1,0 +1,6 @@
+Using the latest cached version of the dataset since openai/gsm8k couldn't be found on the Hugging Face Hub (offline mode is enabled).
+Found the latest cached dataset configuration 'main' at /Users/joshuapurtell/.cache/huggingface/datasets/openai___gsm8k/main/0.0.0/740312add88f781978c0658806c59bc2815b9866 (last modified on Sun Aug  2 13:49:48 2026).
+[guard] admitted: 57.6 GB free, expect ~3.0 GB, pid 10624
+GSM8K sft  model=Qwen/Qwen3.5-0.8B  lora r=8
+eval seeds 0..39 (fixed, shared by every arm)
+

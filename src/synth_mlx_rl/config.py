@@ -59,7 +59,15 @@ class Settings:
     lora_keys: tuple[str, ...] | None = None
     max_seq_length: int = 4096
     enable_thinking: bool = False
-    grad_checkpoint: bool = False
+    # On by default. Measured on Qwen3.5-0.8B, one 768-token datum:
+    #   off:  33.40 GB peak,  9.8 train tok/s
+    #   on :   7.30 GB peak, 35.0 train tok/s
+    # It is faster AND smaller. Recomputation is supposed to trade time for
+    # memory, but retained activations across 28 layers cost ~42 MB/token, and
+    # at 1024 tokens peak reached 44 GB against Metal's 51.8 GB recommended
+    # working set -- so the allocator thrashed and time went superlinear. Below
+    # the working set the recompute is cheaper than the thrash it avoids.
+    grad_checkpoint: bool = True
     clear_cache_every: int = 1
     seed: int = 0
     #: How many frozen sampling snapshots stay resident. One resident base model
@@ -106,7 +114,7 @@ class Settings:
             lora_keys=parse_lora_keys(keys.split(",") if keys else None),
             max_seq_length=_env_int("MAX_SEQ_LENGTH", 4096),
             enable_thinking=_env_bool("ENABLE_THINKING", False),
-            grad_checkpoint=_env_bool("GRAD_CHECKPOINT", False),
+            grad_checkpoint=_env_bool("GRAD_CHECKPOINT", True),
             clear_cache_every=_env_int("CLEAR_CACHE_EVERY", 1),
             seed=_env_int("SEED", 0),
             max_snapshots=_env_int("MAX_SNAPSHOTS", 4),

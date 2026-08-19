@@ -1,0 +1,25 @@
+[guard] admitted: 58.2 GB free, expect ~3.0 GB, pid 52253
+GSM8K cispo  model=Qwen/Qwen3.5-0.8B  lora r=8
+eval seeds 0..39 (fixed, shared by every arm)
+
+Using the latest cached version of the dataset since openai/gsm8k couldn't be found on the Hugging Face Hub (offline mode is enabled).
+Found the latest cached dataset configuration 'main' at /Users/joshuapurtell/.cache/huggingface/datasets/openai___gsm8k/main/0.0.0/740312add88f781978c0658806c59bc2815b9866 (last modified on Sun Aug  2 13:49:48 2026).
+  [baseline] held-out 12.0/40 = 0.3000  (130s)
+Using the latest cached version of the dataset since openai/gsm8k couldn't be found on the Hugging Face Hub (offline mode is enabled).
+Found the latest cached dataset configuration 'main' at /Users/joshuapurtell/.cache/huggingface/datasets/openai___gsm8k/main/0.0.0/740312add88f781978c0658806c59bc2815b9866 (last modified on Sun Aug  2 13:49:48 2026).
+  round 0: train_reward=0.219 datums=16 refused=0 steps=4
+  round 1: train_reward=0.281 datums=8 refused=0 steps=6
+  round 2: train_reward=0.375 datums=24 refused=0 steps=12
+  round 3: train_reward=0.219 datums=16 refused=0 steps=16
+  round 4: train_reward=0.438 datums=16 refused=0 steps=20
+  round 5: train_reward=0.250 datums=12 refused=0 steps=23
+  round 6: train_reward=0.406 datums=20 refused=0 steps=28
+  round 7: train_reward=0.250 datums=8 refused=0 steps=30
+  [after cispo] held-out 9.0/40 = 0.2250  (118s)
+  [store] sha256:98fa1292321c608a0..  run=gsm8k-cispo-1787103883
+
+==========================================================
+  baseline   0.3000
+  final      0.2250
+  uplift     -0.0750  (-25.0% relative)
+==========================================================
