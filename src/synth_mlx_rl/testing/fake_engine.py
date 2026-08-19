@@ -19,10 +19,10 @@ import json
 from pathlib import Path
 from typing import Any, Sequence
 
+from ..backends import NumpyOps
 from ..config import Settings
 from ..engine_base import EngineBase
 from ..kernel import policy_terms, sft_terms
-from ..backends import NumpyOps
 from ..renderer import Renderer
 from ..schemas import (
     AdamParams,
@@ -299,6 +299,13 @@ class FakeEngine(EngineBase):
     def save_checkpoint(self, name: str) -> CheckpointResponse:
         path = self.settings.checkpoint_dir / name
         path.mkdir(parents=True, exist_ok=True)
+        (path / "adapters.safetensors").write_bytes(b"fake adapter")
+        (path / "adapter_config.json").write_text(
+            '{"model":"fake/Qwen3.5-0.8B","fine_tune_type":"lora"}\n'
+        )
+        (path / "state.json").write_text(
+            f'{{"step":{self._step},"training_version":{self._training_version}}}\n'
+        )
         return CheckpointResponse(
             path=str(path), step=self._step, training_version=self._training_version
         )

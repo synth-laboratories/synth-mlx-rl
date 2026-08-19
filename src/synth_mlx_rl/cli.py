@@ -25,6 +25,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8787)
     serve.add_argument("--log-level", default="info")
+    serve.add_argument("--root", type=Path, default=Path(".synth-mlx-rl"))
     serve.add_argument("--model")
     serve.add_argument("--checkpoint-dir", type=Path)
     serve.add_argument("--adapter-path", type=Path)
@@ -95,11 +96,11 @@ def main() -> None:
     if args.command == "serve":
         import uvicorn
 
-        from .api.app import create_app
+        from .service import create_app
 
         settings = settings_from_args(args)
         uvicorn.run(
-            create_app(settings=settings),
+            create_app(args.root, settings=settings),
             host=args.host,
             port=args.port,
             log_level=args.log_level,
