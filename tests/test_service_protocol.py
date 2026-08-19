@@ -163,3 +163,22 @@ def test_service_starts_without_importing_mlx() -> None:
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "CLEAN", result.stdout
+
+
+def test_mixing_reductions_in_one_accumulation_window_is_refused(client) -> None:
+    """`mean_tokens` weights each call by its tokens and divides by the total at
+    optim_step; `sum` accumulates as-is and divides by nothing. Mixing them
+    composes the two normalizations into something that is neither convention,
+    so it is refused rather than silently averaged."""
+    datum = {"input_ids": [1, 2, 3], "target_ids": [2, 3, 4], "weights": [0.0, 1.0, 1.0]}
+    first = client.post(
+        "/v1/forward_backward",
+        json={"data": [datum], "loss_fn": "cross_entropy", "reduction": "sum"},
+    )
+    assert first.status_code == 200, first.text
+    second = client.post(
+        "/v1/forward_backward",
+        json={"data": [datum], "loss_fn": "cross_entropy", "reduction": "mean_tokens"},
+    )
+    assert second.status_code >= 400
+    assert "mix reductions" in second.text

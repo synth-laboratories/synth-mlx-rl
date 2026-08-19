@@ -140,3 +140,41 @@ def test_reference_kl_is_non_negative_k3() -> None:
         reference_mask=np.ones(2),
     )
     assert metrics.reference_kl > 0.0
+
+
+def test_sum_and_mean_reductions_differ_by_the_token_count() -> None:
+    """The Tinker compatibility trap, pinned.
+
+    Tinker reduces cross-entropy with `sum`; this service defaults to
+    `mean_tokens` (what SLIME recommends for SFT and what TRL does). They differ
+    by a factor of the unmasked token count -- hundreds, typically -- so a
+    ported script tuned at lr=1e-4 would train hundreds of times harder with
+    nothing raising. The field is explicit for exactly that reason.
+    """
+    import numpy as np
+
+    from synth_mlx_rl.backends import NumpyOps
+    from synth_mlx_rl.kernel import sft_terms
+
+    ops = NumpyOps()
+    logprobs = np.array([-1.0, -2.0, -0.5, -3.0])
+    weights = np.array([0.0, 1.0, 1.0, 1.0])   # 3 unmasked tokens
+
+    mean_loss, _ = sft_terms(ops, logprobs, weights, "mean_tokens")
+    sum_loss, _ = sft_terms(ops, logprobs, weights, "sum")
+
+    assert float(sum_loss) == pytest.approx(5.5)          # 2.0 + 0.5 + 3.0
+    assert float(mean_loss) == pytest.approx(5.5 / 3)
+    assert float(sum_loss) == pytest.approx(float(mean_loss) * 3)
+
+
+def test_mean_tokens_is_the_default() -> None:
+    import numpy as np
+
+    from synth_mlx_rl.backends import NumpyOps
+    from synth_mlx_rl.kernel import sft_terms
+
+    ops = NumpyOps()
+    logprobs = np.array([-1.0, -2.0])
+    weights = np.array([1.0, 1.0])
+    assert float(sft_terms(ops, logprobs, weights)[0]) == pytest.approx(1.5)

@@ -206,6 +206,7 @@ class FakeEngine(EngineBase):
         objective plumbing, the token-weighted accumulation, and the metric
         names are the production ones.
         """
+        reduction = self.check_reduction(request)
 
         import numpy as np
 
@@ -220,7 +221,7 @@ class FakeEngine(EngineBase):
                 weights = np.asarray(datum.weights, dtype=np.float64)
                 current = np.full(weights.shape, -0.25, dtype=np.float64)
                 if spec.name == "cross_entropy":
-                    loss, terms = sft_terms(ops, current, weights)
+                    loss, terms = sft_terms(ops, current, weights, reduction)
                 else:
                     behavior = np.asarray(
                         datum.behavior_logprobs, dtype=np.float64

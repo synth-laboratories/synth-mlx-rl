@@ -85,17 +85,27 @@ def _sanitize(
 
 
 def sft_terms(
-    ops: ArrayOps, current_logprobs: Any, weights: Any
+    ops: ArrayOps,
+    current_logprobs: Any,
+    weights: Any,
+    reduction: str = "mean_tokens",
 ) -> tuple[Any, dict[str, Any]]:
-    """Masked cross-entropy, reduced over unmasked tokens.
+    """Masked cross-entropy.
 
     ``weights`` is not clamped to 1: fractional weights keep their intended
     scale, and validation already guarantees a strictly positive sum.
+
+    ``reduction`` decides step size and the two conventions differ by a factor
+    of the token count. ``mean_tokens`` divides by the unmasked count, so a step
+    is the same size whatever the sequence length. ``sum`` does not, which is
+    the Tinker convention; it is offered so a ported script keeps its tuned
+    learning rate instead of silently training hundreds of times harder.
     """
 
     token_count = ops.sum(weights)
-    mean_logprob = ops.sum(current_logprobs * weights) / token_count
-    loss = -mean_logprob
+    total_logprob = ops.sum(current_logprobs * weights)
+    mean_logprob = total_logprob / token_count
+    loss = -total_logprob if reduction == "sum" else -mean_logprob
     return loss, {
         "loss": loss,
         "token_count": token_count,

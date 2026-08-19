@@ -216,6 +216,7 @@ class MLXEngine(EngineBase):
         self._grad_accum: Any | None = None
         self._accumulation_count = 0
         self._accumulation_weight = 0.0
+        self._accumulation_reduction = "mean_tokens"
         self._operation_count = 0
         self._optimizer: Any | None = None
         self._optimizer_shape: tuple[float, float, float, float, bool] | None = None
@@ -659,11 +660,11 @@ class MLXEngine(EngineBase):
         return (token_entropy * weights).sum() / token_count
 
     def _sft_loss(
-        self, model: Any, inputs: Any, targets: Any, weights: Any
+        self, model: Any, inputs: Any, targets: Any, weights: Any, reduction: str
     ) -> tuple[Any, dict[str, Any]]:
         logits = model(inputs)
         current = self._selected_logprobs(logits, targets)
-        return sft_terms(self.ops, current, weights)
+        return sft_terms(self.ops, current, weights, reduction)
 
     def _policy_loss(
         self,
@@ -726,6 +727,7 @@ class MLXEngine(EngineBase):
                         batch["inputs"],
                         batch["targets"],
                         batch["weights"],
+                        getattr(request, "reduction", "mean_tokens"),
                     )
                 else:
                     value_and_grad = self.nn.value_and_grad(
@@ -751,7 +753,16 @@ class MLXEngine(EngineBase):
             # Each accumulation contributes gradients weighted by its own token
             # count. `optim_step` divides by the summed weight. Together they
             # produce one mean over every unmasked token in the window.
-            batch_weight = float(metrics["token_count"])
+            # The accumulation scaling has to match the reduction, or the two
+            # normalizations compose into something that is neither convention.
+            #   mean_tokens: weight each call by its tokens, divide by the total
+            #                at optim_step -> one global mean over the window.
+            #   sum:         accumulate as-is, divide by nothing -> a sum of
+            #                sums, which is what `sum` means.
+            reduction = self.check_reduction(request)
+            batch_weight = (
+                float(metrics["token_count"]) if reduction == "mean_tokens" else 1.0
+            )
             weighted_gradients = self.tree_map(
                 lambda gradient: gradient * batch_weight, gradients
             )
@@ -834,7 +845,11 @@ class MLXEngine(EngineBase):
             assert self._optimizer is not None
 
             count = self._accumulation_count
-            token_weight = self._accumulation_weight
+            token_weight = (
+                self._accumulation_weight
+                if self._accumulation_reduction == "mean_tokens"
+                else 1.0
+            )
             if token_weight <= 0.0:
                 raise RuntimeError("accumulated gradient token weight is zero")
             # --- global unmasked-token reduction, part 2 of 2 ---

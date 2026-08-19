@@ -38,6 +38,30 @@ logger = logging.getLogger(__name__)
 class EngineBase(ABC):
     """Shared sampling, pinning, and recording behavior."""
 
+
+    _accumulation_reduction: str = "mean_tokens"
+
+    def check_reduction(self, request: Any) -> str:
+        """One reduction per accumulation window, enforced for every engine.
+
+        `mean_tokens` weights each call by its token count and divides by the
+        total at optim_step; `sum` accumulates as-is and divides by nothing.
+        Mixing them composes the two normalizations into a scale that is
+        neither convention, so it is refused rather than silently averaged.
+        """
+        reduction = getattr(request, "reduction", "mean_tokens")
+        pending = getattr(self, "_accumulation_count", None)
+        if pending is None:
+            pending = getattr(self, "accumulation_count", 0)
+        if pending and reduction != self._accumulation_reduction:
+            raise ValueError(
+                f"cannot mix reductions inside one accumulation window: "
+                f"{self._accumulation_reduction!r} then {reduction!r}; "
+                "call optim_step or zero_grad first"
+            )
+        self._accumulation_reduction = reduction
+        return reduction
+
     def __init__(self, settings: Settings, renderer: Renderer):
         self.settings = settings.validated()
         self.renderer = renderer

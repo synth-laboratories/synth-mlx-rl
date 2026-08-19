@@ -123,6 +123,19 @@ class Datum(StrictModel):
 class ForwardBackwardRequest(StrictModel):
     data: list[Datum] = Field(min_length=1)
     loss_fn: str = "cross_entropy"
+    #: How the per-token loss is reduced. This decides step size, and the two
+    #: conventions differ by a factor of the token count -- hundreds, typically.
+    #:
+    #:   mean_tokens  sum(per-token) / unmasked tokens.  The default here, what
+    #:                SLIME recommends for SFT and what TRL/HF do. Step size is
+    #:                independent of sequence length.
+    #:   sum          sum(per-token), no division. The Tinker convention. A
+    #:                600-token trace pushes ~600x harder than a 1-token one.
+    #:
+    #: A ported Tinker script tuned at lr=1e-4 under `sum` will behave nothing
+    #: like the same script here under `mean_tokens`, and nothing errors -- so
+    #: the field is explicit rather than inferred.
+    reduction: Literal["mean_tokens", "sum"] = "mean_tokens"
     clip_epsilon: float = Field(default=0.2, gt=0.0, lt=1.0)
     eps_low: float = Field(default=1.0, ge=0.0)
     eps_high: float = Field(default=4.0, gt=0.0)

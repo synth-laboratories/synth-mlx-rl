@@ -197,10 +197,16 @@ def main() -> int:
             print("no accepted traces; nothing to train on")
             return 1
 
-        # Length-sorted: an accumulation window of a 400-token trace next to a
-        # 50-token one is dominated by the long one either way, but grouping
-        # similar lengths keeps each step's peak predictable.
+        # Length-BUCKETED, then the buckets shuffled. Sorting alone keeps each
+        # step's memory peak predictable, but it also replaced the shuffle it
+        # was written over: the model then sees every short trace first and
+        # every long one last, an unintended curriculum whose final updates are
+        # dominated by long examples. Bucketing keeps the padding efficiency;
+        # shuffling the buckets removes the ordering.
         accepted.sort(key=lambda d: len(d.input_ids))
+        buckets = [accepted[i:i + args.accum] for i in range(0, len(accepted), args.accum)]
+        rng.shuffle(buckets)
+        accepted = [datum for bucket in buckets for datum in bucket]
         if args.max_traces:
             accepted = accepted[:args.max_traces]
             print(f"  capped to {len(accepted)} traces")
