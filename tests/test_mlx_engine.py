@@ -56,7 +56,6 @@ def test_mlx_kernel_matches_the_numpy_reference() -> None:
     from synth_mlx_rl.backends import MlxOps
     from synth_mlx_rl.kernel import policy_terms
     from synth_mlx_rl.objective_spec import ObjectiveSpec
-    from synth_mlx_rl.objectives import policy_loss
 
     rng = np.random.default_rng(0)
     behavior = rng.normal(-1.5, 1.0, 32)

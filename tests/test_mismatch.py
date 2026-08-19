@@ -129,21 +129,22 @@ def test_tis_is_a_separate_stage_from_the_objective_clip() -> None:
     """Applying TIS must scale the loss without touching the policy gradient's
     own clipping decision. A codebase that folds them together can report
     neither honestly."""
-    from synth_mlx_rl.backends import NumpyOps
+    mx = pytest.importorskip("mlx.core")
+    from synth_mlx_rl.backends import MlxOps
     from synth_mlx_rl.kernel import policy_terms
     from synth_mlx_rl.objective_spec import ObjectiveSpec
 
     spec = ObjectiveSpec(name="grpo", clip_epsilon=0.2)
     common = dict(
-        current_logprobs=np.array([-1.0, -2.0]),
-        behavior_logprobs=np.array([-1.0, -2.0]),
-        advantages=np.array([1.0, 1.0]),
-        weights=np.array([1.0, 1.0]),
+        current_logprobs=mx.array([-1.0, -2.0]),
+        behavior_logprobs=mx.array([-1.0, -2.0]),
+        advantages=mx.array([1.0, 1.0]),
+        weights=mx.array([1.0, 1.0]),
     )
-    ops = NumpyOps()
+    ops = MlxOps(mx)
     _, plain = policy_terms(ops, spec, **common)
     _, weighted = policy_terms(
-        ops, spec, **common, tis_weights=np.array([0.5, 0.5])
+        ops, spec, **common, tis_weights=mx.array([0.5, 0.5])
     )
     assert float(weighted["policy_loss"]) == pytest.approx(float(plain["policy_loss"]) * 0.5)
     # The clip fraction is a property of the policy ratio and must not move.

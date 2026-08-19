@@ -1,11 +1,10 @@
 """Wire and durability tests for the one real backend.
 
 There is no fixture or smoke backend to test against: the service offers
-`qwen_lora` and nothing else. These tests inject a fake *engine* at the seam the
-service already exposes, so the whole job state machine -- preflight, configure,
-launch, metrics, cancel, checkpoint, handoff, reopen -- is exercised on the real
-backend's code path without MLX or a model download. Real MLX bindings are
-covered by `test_mlx_engine.py`.
+`qwen_lora` and nothing else, and these tests drive it with the real resident
+MLX engine. There is no fake engine to fall back to: the whole job state machine
+-- preflight, configure, launch, metrics, cancel, checkpoint, handoff, reopen --
+runs against a model that is actually loaded.
 
 Every client is entered as a context manager: the engine binds in the app
 lifespan, so a client that never starts has no engine and every job fails.
@@ -25,7 +24,6 @@ from fastapi.testclient import TestClient
 from synth_mlx_rl.config import Settings
 from synth_mlx_rl.service import create_app
 from synth_mlx_rl.storage import sha256_path
-from synth_mlx_rl.testing import FakeEngine
 
 RESIDENT = dict(
     model="Qwen/Qwen3.5-0.8B",
@@ -40,8 +38,7 @@ RESIDENT = dict(
 def _client(root: Path, tmp_path: Path) -> Iterator[TestClient]:
     """A service whose only backend is real, driven by a fake engine."""
     settings = Settings(checkpoint_dir=tmp_path / "adapters", **RESIDENT)
-    engine = FakeEngine(checkpoint_dir=tmp_path / "adapters")
-    with TestClient(create_app(root, settings=settings, engine=engine)) as client:
+    with TestClient(create_app(root, settings=settings)) as client:
         yield client
 
 
@@ -204,7 +201,6 @@ def test_qwen_lora_job_persists_real_adapter_contract_and_render_lineage(
         max_seq_length=1024,
         enable_thinking=False,
     )
-    engine = FakeEngine(checkpoint_dir=root / "adapters")
     dataset = tmp_path / "qwen.jsonl"
     dataset.write_text(
         '{"messages":[{"role":"user","content":"Say ready"},'
@@ -231,7 +227,7 @@ def test_qwen_lora_job_persists_real_adapter_contract_and_render_lineage(
             "enable_thinking": False,
         },
     }
-    with TestClient(create_app(root, settings=settings, engine=engine)) as client:
+    with TestClient(create_app(root, settings=settings)) as client:
         capabilities = client.get("/v1/capabilities").json()
         assert capabilities["qwen_lora_contract"] == {
             "backend": "qwen_lora",
@@ -269,7 +265,6 @@ def test_qwen_preflight_fails_closed_on_resident_render_contract_mismatch(
     tmp_path: Path,
 ) -> None:
     settings = Settings(model="Qwen/Qwen3.5-0.8B", lora_rank=8, max_seq_length=1024)
-    engine = FakeEngine(checkpoint_dir=tmp_path / "adapters")
     payload = _payload(tmp_path, job_id="mismatch")
     payload["config"].update(  # type: ignore[union-attr]
         {
@@ -281,7 +276,7 @@ def test_qwen_preflight_fails_closed_on_resident_render_contract_mismatch(
             "enable_thinking": False,
         }
     )
-    with TestClient(create_app(tmp_path / "service", settings=settings, engine=engine)) as client:
+    with TestClient(create_app(tmp_path / "service", settings=settings)) as client:
         preflight = client.post("/v1/jobs/preflight", json=payload).json()
     assert preflight["accepted"] is False
     assert "do not match the resident service" in preflight["checks"]["backend"]["reason"]

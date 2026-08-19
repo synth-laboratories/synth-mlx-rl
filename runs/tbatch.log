@@ -1,7 +1,0 @@
-[guard] admitted: 57.6 GB free, expect ~4.0 GB, pid 35295
-Fetching 10 files:   0%|          | 0/10 [00:00<?, ?it/s]Fetching 10 files: 100%|██████████| 10/10 [00:00<00:00, 3121.92it/s]
- batch   len   wall ms  peak GB     tok/s   vs B=1
-     1   512      4483     5.38      57.1    1.00x
-     2   512      7139     9.48      71.7    1.26x
-     4   512     14366    17.56      71.3    1.25x
-     6   512     25611    25.47      60.0    1.05x
