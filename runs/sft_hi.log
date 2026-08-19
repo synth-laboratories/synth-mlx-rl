@@ -14,3 +14,18 @@ collecting: 48 train prompts x 16 samples, temp=0.8
   48/48 prompts, 387/768 accepted (1170s)
   accepted 387/768 traces (50.4%)
   cached -> runs/traces_hi.jsonl
+  capped to 100 traces
+  step   5  loss 0.1713  60 train tok/s
+  step  10  loss 0.2249  67 train tok/s
+  step  15  loss 0.3805  44 train tok/s
+  step  20  loss 0.3470  55 train tok/s
+  step  25  loss 0.3116  49 train tok/s
+  [after sft] held-out 35.0/60 = 0.5833  (275s)
+  training: 25 steps, 28488 weighted tokens, 517s -> 55 train tok/s
+  [store] sha256:5578825b5ff729f57..  run=gsm8k-sft-1787111523
+
+==========================================================
+  baseline   0.4500
+  final      0.5833
+  uplift     +0.1333  (+29.6% relative)
+==========================================================
