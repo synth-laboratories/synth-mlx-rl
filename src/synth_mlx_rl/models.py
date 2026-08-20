@@ -109,6 +109,7 @@ class TrainingConfig(BaseModel):
     learning_rate: float = Field(default=0.01, gt=0, le=1)
     lora_rank: int = Field(default=8, ge=1, le=256)
     lora_alpha: float = Field(default=16.0, gt=0)
+    lora_dropout: float = Field(default=0.0, ge=0.0, lt=1.0)
     max_seq_length: int = Field(default=1024, ge=8, le=4096)
     enable_thinking: bool = False
     seed: int = 0
@@ -159,6 +160,13 @@ class Event(BaseModel):
     type: str
     timestamp: str
     payload: dict[str, object] = Field(default_factory=dict)
+    schema_version: str = "training.event.v1"
+    event_id: str = ""
+    job_id: str = ""
+    attempt_id: str = "attempt-1"
+    kind: str = ""
+    occurred_at: str = ""
+    producer: dict[str, str] = Field(default_factory=dict)
 
 
 class Checkpoint(BaseModel):

@@ -183,6 +183,11 @@ class TrainingRunner:
                 )
             if not job.checkpoints:
                 raise ValueError("job has no checkpoint to resume from")
+            if job.config.lora_dropout > 0:
+                raise ValueError(
+                    "resume with lora_dropout>0 is refused; the MLX RNG stream "
+                    "is not persisted and a resumed run would diverge"
+                )
             if job.current_step >= job.config.max_steps:
                 raise ValueError("job already reached max_steps; there is nothing to resume")
             cancel = threading.Event()
