@@ -109,6 +109,7 @@ class TrainingConfig(BaseModel):
     learning_rate: float = Field(default=0.01, gt=0, le=1)
     lora_rank: int = Field(default=8, ge=1, le=256)
     lora_alpha: float = Field(default=16.0, gt=0)
+    lora_dropout: float = Field(default=0.0, ge=0.0, lt=1.0)
     max_seq_length: int = Field(default=1024, ge=8, le=4096)
     enable_thinking: bool = False
     seed: int = 0

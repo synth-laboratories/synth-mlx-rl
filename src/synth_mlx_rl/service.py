@@ -295,6 +295,7 @@ class LocalTrainingService:
             config.base_model != self.settings.model
             or config.lora_rank != self.settings.lora_rank
             or config.lora_alpha != self.settings.lora_alpha
+            or config.lora_dropout != self.settings.lora_dropout
             or config.max_seq_length != self.settings.max_seq_length
             or config.enable_thinking != self.settings.enable_thinking
         ):
