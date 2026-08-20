@@ -19,12 +19,16 @@ def normalize_group_rewards(rewards: Sequence[float]) -> list[float]:
     definition is identical. Sample stdev (n-1), not population, and a 1e-6
     denominator floor.
 
-    Raises rather than returning zeros for a degenerate group. A constant-reward
-    group carries no preference signal, and zeroing it silently would spend a
-    training step on nothing -- the hosted lane treats that as a filtered group
-    and resamples, and so does the local one. A hosted CISPO canary once reached
-    eight Banking77 rollouts where all four groups had zero variance and no
-    optimizer step was ever produced; that is the failure this refuses to hide.
+    It raises only on the inputs slime itself rejects: fewer than two rewards, or
+    a non-finite one. A *constant* group is not rejected here -- with a stdev of
+    zero and a 1e-6 floor it returns all zeros, exactly as the hosted runner
+    does. That is not the safety net. `has_learning_signal` is, and the lane
+    calls it before this: a group with no reward variance is filtered and
+    resampled rather than normalized into a batch of zero advantages, which
+    would spend a training step expressing no preference. A hosted CISPO canary
+    once reached eight Banking77 rollouts where all four groups had zero
+    variance and no optimizer step was ever produced; the filter is what keeps
+    that visible instead of turning it into a no-op update.
     """
 
     values = [float(value) for value in rewards]
