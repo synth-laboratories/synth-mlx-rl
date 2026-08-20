@@ -159,6 +159,13 @@ class Event(BaseModel):
     type: str
     timestamp: str
     payload: dict[str, object] = Field(default_factory=dict)
+    schema_version: str = "training.event.v1"
+    event_id: str = ""
+    job_id: str = ""
+    attempt_id: str = "attempt-1"
+    kind: str = ""
+    occurred_at: str = ""
+    producer: dict[str, str] = Field(default_factory=dict)
 
 
 class Checkpoint(BaseModel):
