@@ -17,6 +17,7 @@ import logging
 import threading
 import time
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Any
 
 from .config import Settings
@@ -29,7 +30,7 @@ from .schemas import (
     SampleRequest,
     SampleResponse,
 )
-from .snapshots import PolicySnapshot, SnapshotPool
+from .snapshots import PolicySnapshot, SnapshotError, SnapshotNotFoundError, SnapshotPool
 
 
 logger = logging.getLogger(__name__)
@@ -130,6 +131,59 @@ class EngineBase(ABC):
 
     def resolve_snapshot(self, snapshot_id: str | None) -> PolicySnapshot:
         return self.snapshots.resolve(snapshot_id)
+
+    def register_policy(
+        self,
+        *,
+        policy_dir: str | Path,
+        snapshot_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> PolicySnapshot:
+        """Freeze the adapter in ``policy_dir`` under an immutable snapshot id.
+
+        Re-registering the same id returns the resident snapshot rather than
+        minting a new name. Eval trials depend on that: two seeds of one
+        candidate must score the same weights.
+        """
+
+        if snapshot_id:
+            try:
+                return self.snapshots.get(snapshot_id)
+            except SnapshotNotFoundError:
+                pass
+        path = Path(policy_dir).expanduser()
+        if not path.is_dir():
+            raise FileNotFoundError(f"policy directory does not exist: {path}")
+        payload = self._policy_payload(path)
+        meta = dict(metadata or {})
+        meta.setdefault("reason", "policy_register")
+        meta["policy_dir"] = str(path)
+        with self._lock:
+            try:
+                return self.snapshots.publish(
+                    payload=payload,
+                    training_version=self._training_version,
+                    step=self._step,
+                    base_model=self.settings.model,
+                    lora_rank=self.settings.lora_rank,
+                    lora_scale=self.settings.lora_scale,
+                    tokenizer_digest=self.renderer.tokenizer_digest,
+                    template_digest=self.renderer.template_digest,
+                    snapshot_id=snapshot_id,
+                    metadata=meta,
+                )
+            except SnapshotError:
+                if snapshot_id:
+                    return self.snapshots.get(snapshot_id)
+                raise
+
+    def _policy_payload(self, policy_dir: Path) -> Any:
+        """Default: freeze the current training adapter (enough for the fake)."""
+
+        del policy_dir
+        with self._lock:
+            self._activate(None)
+            return self._capture_adapter()
 
     # -- rendering -------------------------------------------------------
 

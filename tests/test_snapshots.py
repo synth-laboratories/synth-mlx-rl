@@ -141,3 +141,11 @@ def test_a_pinned_sample_is_unaffected_by_a_step(engine) -> None:
     assert sample.policy_snapshot_id == pinned.id
     assert sample.training_version == pinned.training_version
     assert engine.state().training_version > pinned.training_version
+
+
+def test_register_policy_reuses_the_same_snapshot_id(engine, tmp_path) -> None:
+    policy_dir = tmp_path / "candidate"
+    policy_dir.mkdir()
+    first = engine.register_policy(policy_dir=policy_dir, snapshot_id="snap_abc")
+    second = engine.register_policy(policy_dir=policy_dir, snapshot_id="snap_abc")
+    assert first.id == second.id == "snap_abc"
