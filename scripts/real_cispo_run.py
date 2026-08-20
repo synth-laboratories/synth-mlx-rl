@@ -69,7 +69,8 @@ def request(method: str, url: str, body: dict | None = None, timeout: float = 30
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--steps", type=int, default=8)
-    parser.add_argument("--group-size", type=int, default=4)
+    parser.add_argument("--group-size", type=int, default=6)
+    parser.add_argument("--signal-attempts", type=int, default=24)
     parser.add_argument("--groups-per-step", type=int, default=1)
     parser.add_argument("--micro-batch-size", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
@@ -205,6 +206,7 @@ def main() -> int:
                 },
                 "max_steps": args.steps,
                 "group_size": args.group_size,
+                "signal_attempts": args.signal_attempts,
                 "groups_per_step": args.groups_per_step,
                 "micro_batch_size": args.micro_batch_size,
                 "objective": "cispo_minimax",
