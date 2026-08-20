@@ -1,0 +1,55 @@
+{
+  "schema_version": "gsm8k.sft-dataset.v1",
+  "created_at": "2026-08-20T18:24:33Z",
+  "dataset": {
+    "dataset": "openai/gsm8k",
+    "config": "main",
+    "revision": "740312add88f781978c0658806c59bc2815b9866",
+    "splits": {
+      "train": {
+        "hf_split": "train",
+        "rows": 7473,
+        "digest": "sha256:dca449882e67a1e7716b5da453650a7b16588a1f2d1a0d82394a43d75ea7e9ca"
+      },
+      "heldout": {
+        "hf_split": "test",
+        "rows": 1319,
+        "digest": "sha256:32c548f08195e19e33408b844dd7be6aa4bcae457d957bc05909ff4bd4a00595"
+      }
+    },
+    "shuffle_seed": 20260820,
+    "profile": "hf",
+    "profile_source": "declared"
+  },
+  "prompt": {
+    "source": "synth_containers.platform.gsm8k_world",
+    "system_sha256": "sha256:050a42e42ad601c6529ad74b159f90bbc31a68da1aa7dab10e42bf5a903b7c91"
+  },
+  "files": {
+    "train": {
+      "path": "gsm8k-train-64-a0558fa4ec6c.jsonl",
+      "split": "train",
+      "hf_split": "train",
+      "rows": 64,
+      "seeds": {
+        "first": 0,
+        "last": 63
+      },
+      "sha256": "sha256:a0558fa4ec6c2379e1dfdbf3382a8f29f0c6ba0a6b8bd7d6f1a3d1097d79432b",
+      "bytes": 60659
+    },
+    "eval": {
+      "path": "gsm8k-eval-16-4ffaa737ff28.jsonl",
+      "split": "heldout",
+      "hf_split": "test",
+      "rows": 16,
+      "seeds": {
+        "first": 0,
+        "last": 15
+      },
+      "sha256": "sha256:4ffaa737ff285ea058a63d5ce3cd62d4c0e7f01372faf8b5e14ba0f0f1b0b807",
+      "bytes": 16130
+    }
+  },
+  "containers_src": "/private/tmp/claude-501/-Users-joshuapurtell-Documents-GitHub/e1b7dc1a-98d1-4f35-b204-9c9883281382/scratchpad/containers/src"
+}
