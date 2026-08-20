@@ -16,7 +16,7 @@ def _publish(pool: SnapshotPool, version: int, payload=None):
         payload=payload if payload is not None else {"w": float(version)},
         training_version=version,
         step=version,
-        base_model="fake/Qwen3.5-0.8B",
+        base_model="Qwen/Qwen3.5-0.8B",
         lora_rank=8,
         lora_scale=2.0,
         tokenizer_digest="tok",
@@ -68,16 +68,24 @@ def test_explicit_eviction_is_also_a_tombstone() -> None:
 
 
 def test_a_published_snapshot_is_a_copy_not_an_alias(engine) -> None:
-    """The point of D2: a step must not change what a snapshot holds."""
+    """The point of D2: a step must not change what a snapshot holds.
 
-    snapshot = engine.publish_snapshot()
-    before = dict(snapshot.payload)
+    Checked through what the snapshot *answers*, not through its weights. The
+    payload holds MLX arrays that are only valid on the engine's own thread, so
+    reading them from here raises "There is no Stream(gpu, N) in current
+    thread" -- and a test that reaches around the engine to inspect them is
+    asserting on an implementation detail anyway.
+    """
 
     from synth_mlx_rl.schemas import (
         AdamParams,
         Datum,
         ForwardBackwardRequest,
     )
+
+    tokens = [1, 2, 3, 4]
+    snapshot = engine.publish_snapshot()
+    pinned_before = engine.score_logprobs(tokens, policy_snapshot_id=snapshot.id)
 
     engine.forward_backward(
         ForwardBackwardRequest(
@@ -86,9 +94,10 @@ def test_a_published_snapshot_is_a_copy_not_an_alias(engine) -> None:
     )
     engine.optim_step(AdamParams(learning_rate=0.1))
 
-    assert engine.snapshots.get(snapshot.id).payload == before
-    assert engine._adapter != before
-
+    # The pinned snapshot answers exactly as it did before the step...
+    assert engine.score_logprobs(tokens, policy_snapshot_id=snapshot.id) == pinned_before
+    # ...and the live policy has actually moved, or the check above proves nothing.
+    assert engine.score_logprobs(tokens, policy_snapshot_id=None) != pinned_before
 
 def test_optim_step_bumps_the_training_version_without_publishing(engine) -> None:
     from synth_mlx_rl.schemas import AdamParams, Datum, ForwardBackwardRequest

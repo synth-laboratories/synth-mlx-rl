@@ -1,13 +1,8 @@
-"""The objective math the learner actually executes.
+"""The objective math the learner executes. The only implementation of it.
 
-Written once, against a small array-operation namespace, so that the expression
-tree evaluated by MLX on Apple Silicon is byte-for-byte the same source that the
-portable test suite exercises with a NumPy backend and with a forward-mode
-autodiff backend. MLX is never imported here.
-
-``objectives.py`` holds a second, independently written pure-NumPy
-implementation. It is the parity oracle: if the two disagree, one of them is
-wrong, and the test suite says so.
+Written against a small array-operation namespace so the expression tree stays
+readable and MLX is never imported here -- ``MlxOps`` is injected by the engine
+once the model is resident on its own thread.
 """
 
 from __future__ import annotations

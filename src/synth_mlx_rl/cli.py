@@ -100,7 +100,11 @@ def main() -> None:
 
         settings = settings_from_args(args)
         uvicorn.run(
-            create_app(args.root, settings=settings),
+            create_app(
+                args.root,
+                settings=settings,
+                sampler_base_url=f"http://{args.host}:{args.port}",
+            ),
             host=args.host,
             port=args.port,
             log_level=args.log_level,

@@ -27,7 +27,7 @@ from synth_containers.platform.gsm8k_world import (  # noqa: E402
 from synth_mlx_rl.config import Settings  # noqa: E402
 from synth_mlx_rl.engine import MLXEngine  # noqa: E402
 from synth_mlx_rl.mismatch import MismatchPolicy, measure_mismatch  # noqa: E402
-from synth_mlx_rl.objectives import group_normalize_rewards  # noqa: E402
+from synth_mlx_rl.rewards import group_normalize_rewards  # noqa: E402
 from synth_mlx_rl.schemas import (  # noqa: E402
     AdamParams, Datum, ForwardBackwardRequest, SampleRequest,
 )

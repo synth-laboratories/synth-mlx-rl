@@ -19,9 +19,7 @@ from .snapshots import PolicySnapshot
 class LearnerEngine(Protocol):
     """What the HTTP layer needs from an engine.
 
-    Both :class:`synth_mlx_rl.engine.MLXEngine` and
-    :class:`synth_mlx_rl.testing.FakeEngine` satisfy this, which is what lets
-    the whole service be tested without MLX.
+    :class:`synth_mlx_rl.engine.MLXEngine` is the implementation.
     """
 
     renderer: Any
