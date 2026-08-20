@@ -552,12 +552,8 @@ class TrainingRunner:
 
             groups: list[tuple[list, list[float]]] = []
             for group_index in range(job.config.groups_per_step):
-                # A group shares one task instance so its advantages are
-                # relative to the same problem; instances rotate across the run
-                # so the policy learns the task rather than one row of it.
-                instance = instances.next_batch()[0]
                 group = self._collect_group(
-                    job, client, cancelled, step, group_index, policy_version, instance, launch
+                    job, client, cancelled, step, group_index, policy_version, instances, launch
                 )
                 groups.append(group)
 
@@ -709,19 +705,27 @@ class TrainingRunner:
         step: int,
         group_index: int,
         policy_version: str,
-        instance: int,
+        instances: "_MinibatchStream",
         launch: str,
     ):
         """One group with a usable signal, or a failure that says why.
 
-        A group whose rewards are all equal defines no preference and is
-        resampled rather than trained on. Hosted emits `rollout.group_filtered`
-        with reason `zero_advantage` and eventually raises
-        `cispo_no_learning_signal`; so does this.
+        A group shares one task instance, which is what makes its advantages
+        group-*relative*. A group whose rewards are all equal defines no
+        preference and is filtered rather than trained on -- and the retry draws
+        a *different* instance, because retrying the same one mostly reproduces
+        the same answer. An instance the policy fails uniformly is not a
+        transient failure to sample through; it is a problem this policy cannot
+        yet distinguish, and there is nothing to learn from four identical
+        wrong answers to it.
+
+        Hosted emits `rollout.group_filtered` with reason `zero_advantage` and
+        eventually raises `cispo_no_learning_signal`; so does this.
         """
 
         for attempt in range(1, job.config.signal_attempts + 1):
             self._cancel_boundary(cancelled)
+            instance = instances.next_batch()[0]
             summaries = []
             for member in range(job.config.group_size):
                 summary = client.rollout(

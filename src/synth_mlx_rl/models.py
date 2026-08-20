@@ -86,7 +86,7 @@ class TrainingConfig(BaseModel):
     groups_per_step: int = Field(default=1, ge=1, le=64)
     #: How many times to resample a group that came back with no reward
     #: variance before failing the step. Hosted calls this a filtered group.
-    signal_attempts: int = Field(default=3, ge=1, le=16)
+    signal_attempts: int = Field(default=6, ge=1, le=32)
     objective: Literal["cispo_minimax", "cispo_two_sided"] = "cispo_minimax"
     #: Clip bounds are `[1 - eps_low, 1 + eps_high]`. `cispo_minimax` is
     #: single-sided by definition and refuses an active lower bound.
