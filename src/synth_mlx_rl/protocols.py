@@ -61,6 +61,14 @@ class LearnerEngine(Protocol):
 
     def resolve_snapshot(self, snapshot_id: str | None) -> PolicySnapshot: ...
 
+    def register_policy(
+        self,
+        *,
+        policy_dir: str | Any,
+        snapshot_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> PolicySnapshot: ...
+
     def save_checkpoint(self, name: str) -> CheckpointResponse: ...
 
     def load_checkpoint(self, name: str) -> CheckpointResponse: ...
