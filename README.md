@@ -8,23 +8,36 @@ produces leaves that machine.
 capabilities/preflight → configure → launch → metrics/events → checkpoint → handoff → reopen
 ```
 
-## One backend
+## Two lanes, both real
 
-`qwen_lora` is the only backend. It performs a real LoRA fine-tune of
-`Qwen/Qwen3.5-0.8B` through the resident MLX engine and writes an
-`mlx-lora.v1` adapter you can serve. There is no fixture backend and no
-compute-smoke backend: a job that cannot produce a usable model has no place on
-a product surface, so tests inject a fake *engine* at the service's own seam
-rather than a fake backend on its API.
+`qwen_lora` is offline supervised fine-tuning from a dataset. `cispo` is the
+on-policy lane: it collects grouped rollouts from a task container, turns their
+rewards into group advantages, and applies the CISPO objective. Both fine-tune
+`Qwen/Qwen3.5-0.8B` through the resident MLX engine and write an `mlx-lora.v1`
+adapter you can serve.
+
+There is no fixture backend and no compute-smoke backend: a job that cannot
+produce a usable model has no place on a product surface. There is no fake
+engine either -- the test suite runs against a resident model.
+
+The `cispo` lane mirrors the hosted Tinker runner on purpose: the same slime
+group normalization, the same refusal to train on a group whose rewards are all
+equal, the same advantage placement over completion tokens only. A local number
+computed from a different advantage definition would not be comparable to a
+hosted one, which is most of why both lanes exist. It talks to the task
+container over the hosted `training.rollout.request.v1` contract and serves the
+hosted sampler shape at `/v1/training/sample`, so one unmodified container can
+drive either lane.
 
 `GET /v1/capabilities` is the authority on what this host can do. It reports
 `qwen_lora_training` against the actual platform, MLX install, and resident
 model, and it reports honestly on what is still missing:
 
 ```text
-qwen_lora_training       real LoRA SFT, when Apple Silicon + mlx + mlx-lm are present
+qwen_lora_training       offline SFT, when Apple Silicon + mlx + mlx-lm are present
+cispo_training           the on-policy lane, same stack
+resume_from_checkpoint   caller-initiated, restores weights and Adam moments
 local_training           requires macOS arm64
-automatic_resume         false — optimizer state is not yet durable
 tinker_training_subset   false — local job API only
 ```
 
@@ -77,6 +90,25 @@ job state. On process restart an active job becomes `interrupted`; completed
 jobs, checkpoints, and handoff information reopen durably. No endpoint will
 represent an interrupted run as resumed.
 
+## The on-policy lane
+
+```bash
+# a task container speaking the hosted rollout contract, on loopback
+SYNTH_CONTAINERS_ALLOW_LOOPBACK_SAMPLER=1 SYNTH_BANKING77_SOURCE=hf \
+  python -c "import uvicorn; from synth_containers.platform import create_compat_app; \
+             uvicorn.run(create_compat_app('banking77_classify'), port=8114)"
+
+python scripts/real_cispo_run.py --steps 12 --group-size 4
+```
+
+RL needs a policy that already succeeds sometimes. Asked to classify a
+card-fraud query, the base model answers `fraud` -- reasonable, and not one of
+the 77 labels, so exact match scores it zero, every rollout in the group scores
+zero, and the lane correctly refuses a group with no reward variance. Warm-start
+with the SFT lane first (`--warmstart-train`, and
+`scripts/banking77_sft_dataset.py` builds the set from the container's own
+prompt so there is no train/serve skew), then let CISPO improve it.
+
 ## Serving a trained adapter
 
 The same process serves inference. Adapters are content-addressed by the SHA-256
@@ -96,13 +128,13 @@ See `docs/STORE.md` for the adapter store and lineage, and
 
 ## Not here yet
 
-- **Resume.** Neither the MLX RNG state nor accumulated gradients are persisted,
-  so `run.json` records `resumable: false`. A layout that looks resumable but is
-  not is worse than one that says so.
-- **CISPO as a job.** The objective is implemented and correct — MiniMax
-  Eq. 4–5, refusing `eps_low < 1` under `cispo_minimax` — and reachable through
-  the low-level `/v1/forward_backward` surface, but no job backend sequences
-  rollouts into it. That surface is experimental and is not a product lane.
+- **Bit-exact resume under dropout.** Weights, Adam moments and the step are
+  restored together by `POST /v1/jobs/{id}/resume`, but the MLX RNG stream is
+  not persisted, so a resumed run diverges if `lora_dropout > 0`. At the default
+  of 0.0 it has no effect.
+- **A trained-on-rollouts evaluation beyond mean reward.** The on-policy lane
+  reports paired held-out mean reward before and after; it does not yet report a
+  significance interval, and a run of this size could not support one.
 - **More models.** A second base model arrives behind a measured admission probe
   that records peak memory and throughput on the caller's machine, never by
   relaxing the pin.
