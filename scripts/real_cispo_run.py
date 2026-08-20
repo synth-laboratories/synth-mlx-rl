@@ -246,7 +246,11 @@ def main() -> int:
                         f"reward={data['reward_mean']:.3f}±{data['reward_std']:.3f}  "
                         f"adv±{data['advantage_std']:.2f}  "
                         f"clip={data.get('clip_fraction') or 0:.2f}  "
-                        f"{data['tokens']:.0f} tok in {data['step_seconds']:.0f}s"
+                        f"{data['tokens']:.0f} tok  "
+                        f"[rollout {data['rollout_seconds']:.0f}s "
+                        f"({data['rollouts_used']}/{data['rollouts_collected']} kept) "
+                        f"+ update {data['update_seconds']:.0f}s "
+                        f"= {data['step_seconds']:.0f}s]"
                     )
                 elif kind == "rollout.group_filtered":
                     print(

@@ -550,12 +550,23 @@ class TrainingRunner:
             )
             policy_version = snapshot.id
 
+            # Timed separately from the update. Without the split a step is one
+            # opaque number and the first question anyone asks of an on-policy
+            # lane -- is this environment-bound or compute-bound? -- cannot be
+            # answered from the run's own record. On a slow or paid environment
+            # that distinction is the whole cost model.
+            rollout_started = time.monotonic()
             groups: list[tuple[list, list[float]]] = []
+            attempts_used = 0
             for group_index in range(job.config.groups_per_step):
-                group = self._collect_group(
+                summaries, rewards, attempts = self._collect_group(
                     job, client, cancelled, step, group_index, policy_version, instances, launch
                 )
-                groups.append(group)
+                attempts_used += attempts
+                groups.append((summaries, rewards))
+            rollout_seconds = time.monotonic() - rollout_started
+            rollouts_collected = attempts_used * job.config.group_size
+            rollouts_used = len(groups) * job.config.group_size
 
             batch: list = []
             advantage_values: list[float] = []
@@ -575,6 +586,7 @@ class TrainingRunner:
             if not batch or completion_tokens == 0:
                 raise RuntimeError("cispo_empty_training_batch")
 
+            update_started = time.monotonic()
             weighted_loss = 0.0
             tokens = 0.0
             metrics: dict[str, object] = {}
@@ -594,6 +606,7 @@ class TrainingRunner:
                 tokens += micro_tokens
                 metrics = dict(forward.metrics)
             engine.optim_step(optimizer)
+            update_seconds = time.monotonic() - update_started
 
             self._record_step(
                 job.job_id,
@@ -614,6 +627,14 @@ class TrainingRunner:
                     "clip_fraction": metrics.get("clip_fraction"),
                     "mean_ratio": metrics.get("mean_ratio"),
                     "completion_tokens": completion_tokens,
+                    "rollout_seconds": rollout_seconds,
+                    "update_seconds": update_seconds,
+                    # Collected includes the groups thrown away for having no
+                    # reward variance; used is what reached the optimizer. The
+                    # gap between them is the real sample cost of this lane.
+                    "rollouts_collected": rollouts_collected,
+                    "rollouts_used": rollouts_used,
+                    "groups_filtered": attempts_used - len(groups),
                 },
             )
             if step % job.config.checkpoint_every == 0 or step == job.config.max_steps:
@@ -750,7 +771,7 @@ class TrainingRunner:
                 )
             rewards = [summary.reward for summary in summaries]
             if has_learning_signal(rewards):
-                return summaries, rewards
+                return summaries, rewards, attempt
             self.store.append_event(
                 job.job_id,
                 "rollout.group_filtered",
