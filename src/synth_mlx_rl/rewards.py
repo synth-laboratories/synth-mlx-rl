@@ -2,24 +2,43 @@
 
 from __future__ import annotations
 
-from statistics import fmean, pstdev
+import math
+from statistics import fmean, stdev
 from typing import Sequence
 
 
-def group_normalize_rewards(rewards: Sequence[float], eps: float = 1e-4) -> list[float]:
-    """Zero-mean group advantages over a population standard deviation.
+class RewardGroupError(ValueError):
+    """A reward group that cannot produce a learning signal."""
 
-    A constant-reward group carries no preference signal, so it returns zeros
-    rather than amplifying float noise into a direction. This is the check that
-    a hosted CISPO canary failed on eight Banking77 rollouts: four groups, no
-    variance, no optimizer step.
+
+def normalize_group_rewards(rewards: Sequence[float]) -> list[float]:
+    """Group advantages, matching slime's sample-standard-deviation convention.
+
+    This is the same normalization the hosted CISPO runner uses, deliberately:
+    a local result and a hosted one are only comparable if the advantage
+    definition is identical. Sample stdev (n-1), not population, and a 1e-6
+    denominator floor.
+
+    Raises rather than returning zeros for a degenerate group. A constant-reward
+    group carries no preference signal, and zeroing it silently would spend a
+    training step on nothing -- the hosted lane treats that as a filtered group
+    and resamples, and so does the local one. A hosted CISPO canary once reached
+    eight Banking77 rollouts where all four groups had zero variance and no
+    optimizer step was ever produced; that is the failure this refuses to hide.
     """
 
     values = [float(value) for value in rewards]
-    if not values:
-        raise ValueError("rewards must be a non-empty sequence")
+    if len(values) < 2 or any(not math.isfinite(value) for value in values):
+        raise RewardGroupError("cispo_reward_group_invalid")
     mean = fmean(values)
-    std = pstdev(values)
-    if std < eps:
-        return [0.0] * len(values)
-    return [(value - mean) / (std + eps) for value in values]
+    denominator = stdev(values) + 1e-6
+    return [(value - mean) / denominator for value in values]
+
+
+def has_learning_signal(rewards: Sequence[float]) -> bool:
+    """True when a group's rewards differ at all, so an advantage is meaningful."""
+
+    values = [float(value) for value in rewards]
+    if len(values) < 2 or any(not math.isfinite(value) for value in values):
+        return False
+    return any(value != values[0] for value in values[1:])

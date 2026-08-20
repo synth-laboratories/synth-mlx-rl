@@ -5,11 +5,14 @@ from __future__ import annotations
 import json
 import random
 import threading
+import uuid
 import time
 from pathlib import Path
+from statistics import fmean, pstdev
 from typing import Callable, Protocol
 
 from synth_mlx_rl.models import Checkpoint, Job, JobStatus
+from synth_mlx_rl.rewards import has_learning_signal, normalize_group_rewards
 from synth_mlx_rl.storage import JobStore, sha256_file, sha256_path, utc_now
 
 
@@ -59,6 +62,43 @@ class _MinibatchStream:
         return batch
 
 
+def _datum_from_action(datum_cls, action, advantage: float, *, sequence_cap: int):
+    """One sampled turn as a training example, laid out as the hosted lane lays it.
+
+    The observation is scored but carries no advantage: only the tokens the
+    policy actually chose are credited or blamed for the reward, so weights and
+    advantages are zero across the prompt and live over the completion. The
+    behaviour log-probabilities the container returned occupy the same
+    positions, which is what makes the importance ratio a ratio of the same
+    tokens under two policy versions rather than of two different spans.
+    """
+
+    prompt = list(action.prompt_token_ids)
+    completion = list(action.token_ids)
+    behavior = list(action.log_probs)
+    tokens = [*prompt, *completion]
+    if len(tokens) > sequence_cap:
+        raise RuntimeError("rollout_sequence_cap_exceeded")
+    inputs = tokens[:-1]
+    targets = tokens[1:]
+    observation_length = len(prompt) - 1
+    logged = [0.0] * observation_length + behavior
+    advantages = [0.0] * observation_length + [advantage] * len(completion)
+    weights = [0.0] * observation_length + [1.0] * len(completion)
+    if not (len(inputs) == len(targets) == len(logged) == len(advantages) == len(weights)):
+        raise RuntimeError("rollout_training_tensor_unaligned")
+    return (
+        datum_cls(
+            input_ids=inputs,
+            target_ids=targets,
+            weights=weights,
+            behavior_logprobs=logged,
+            advantages=advantages,
+        ),
+        len(completion),
+    )
+
+
 def _mlx_peak_memory() -> int | None:
     """Peak MLX allocation so far, or None when MLX is not loaded.
 
@@ -92,9 +132,15 @@ class TrainingRunner:
         self,
         store: JobStore,
         engine_provider: Callable[[], TrainingEngine] | None = None,
+        sampler_url: str = "http://127.0.0.1:8787/v1/chat/completions",
+        sampler_token: str = "local",
     ) -> None:
         self.store = store
         self._engine_provider = engine_provider
+        # Where the task container calls back to sample. Loopback in both
+        # directions: the sampler and the trainer are the same resident model.
+        self._sampler_url = sampler_url
+        self._sampler_token = sampler_token
         self._threads: dict[str, threading.Thread] = {}
         self._cancel: dict[str, threading.Event] = {}
         self._lock = threading.Lock()
@@ -192,9 +238,12 @@ class TrainingRunner:
             job_id, "job.started", {"backend": job.config.backend, "resumed": resuming}
         )
         try:
-            if job.config.backend != "qwen_lora":  # pydantic validates before persistence
+            if job.config.backend == "qwen_lora":
+                self._run_qwen_lora(job, cancelled, resuming)
+            elif job.config.backend == "cispo":
+                self._run_cispo(job, cancelled, resuming)
+            else:  # pydantic validates before persistence
                 raise RuntimeError(f"unsupported backend {job.config.backend}")
-            self._run_qwen_lora(job, cancelled, resuming)
             job = self.store.load_job(job_id)
             job.status = JobStatus.SUCCEEDED
             job.finished_at = utc_now()
@@ -403,6 +452,315 @@ class TrainingRunner:
             trained_losses = self._qwen_losses(engine, eval_datums)
             self._record_qwen_evaluation(job.job_id, baseline_losses, trained_losses)
 
+    def _run_cispo(
+        self, job: Job, cancelled: threading.Event, resuming: bool = False
+    ) -> None:
+        """The on-policy lane, mirroring the hosted Tinker CISPO runner.
+
+        One step is: collect `groups_per_step` groups of `group_size` rollouts at
+        a pinned policy version, drop and resample any group whose rewards are
+        all equal, normalize each surviving group into advantages, build one
+        datum per sampled turn, and apply a single CISPO update.
+
+        The structure is the hosted one on purpose. Same slime normalization,
+        same filtered-group retry, same advantage placement over completion
+        tokens only, same refusal to invent a signal where the rewards show
+        none. What differs is the transport and the sampler: the container calls
+        back into this service, so the behaviour log-probabilities it returns
+        were produced by the very model being trained, at the policy version the
+        step pinned. Hosted has to reason about two populations there; locally
+        they are one, and the ratio denominator means what it says.
+        """
+
+        if self._engine_provider is None:
+            raise RuntimeError("the resident Qwen MLX engine is not available")
+        from synth_mlx_rl.rollout_client import ContainerRolloutClient
+        from synth_mlx_rl.schemas import AdamParams, Datum, ForwardBackwardRequest
+
+        engine = self._engine_provider()
+        target = job.config.rollout
+        assert target is not None  # config validation guarantees this
+
+        client = ContainerRolloutClient(
+            base_url=target.url,
+            task_id=target.task_id,
+            sampler_url=self._sampler_url,
+            sampler_token=self._sampler_token,
+            bearer_token=target.bearer_token,
+            max_tokens=target.max_tokens,
+            temperature=target.temperature,
+            connection_mode=target.connection_mode,
+        )
+        # Rollout identity is the container's idempotency key, so it has to be
+        # unique per launch. A stable id means a relaunched job replays the
+        # previous attempt's cached result -- including a cached failure.
+        launch = uuid.uuid4().hex[:8]
+        capabilities = client.capabilities()
+        if capabilities.get("max_concurrency", 1) < 1:
+            raise RuntimeError("rollout_container_advertises_no_capacity")
+        job = self.store.load_job(job.job_id)
+        job.render_contract = {
+            "rollout_container_id": capabilities.get("container_id"),
+            "rollout_container_digest": capabilities.get("container_digest"),
+            "rollout_capability_hash": capabilities.get("capability_hash"),
+            "task_id": target.task_id,
+            "objective": job.config.objective,
+            "eps_low": job.config.eps_low,
+            "eps_high": job.config.eps_high,
+        }
+        self.store.save_job(job)
+        self.store.append_event(
+            job.job_id, "rollout.container_admitted", dict(job.render_contract)
+        )
+
+        if resuming:
+            engine.load_checkpoint(Path(job.checkpoints[-1].path).name)
+            start_step = job.current_step + 1
+        else:
+            start_step = 1
+
+        instances = _MinibatchStream(
+            count=target.train_instances,
+            batch_size=1,
+            shuffle=True,
+            seed=job.config.seed,
+        )
+        for _ in range((start_step - 1) * job.config.groups_per_step):
+            instances.next_batch()
+
+        baseline = job.evaluation.get("baseline")
+        if not resuming:
+            baseline = self._heldout_reward(job, client, cancelled, "baseline", launch)
+            job = self.store.load_job(job.job_id)
+            job.evaluation = {**job.evaluation, "baseline": baseline}
+            self.store.save_job(job)
+
+        optimizer = AdamParams(
+            learning_rate=job.config.learning_rate,
+            weight_decay=0.0,
+            max_grad_norm=1.0,
+        )
+        for step in range(start_step, job.config.max_steps + 1):
+            self._cancel_boundary(cancelled)
+            started = time.monotonic()
+            # Pin the policy for the whole step: every rollout in it must be
+            # sampled from the same weights the update is computed against.
+            snapshot = engine.publish_snapshot(
+                metadata={"reason": "cispo_step", "job_id": job.job_id, "step": step}
+            )
+            policy_version = snapshot.id
+
+            groups: list[tuple[list, list[float]]] = []
+            for group_index in range(job.config.groups_per_step):
+                # A group shares one task instance so its advantages are
+                # relative to the same problem; instances rotate across the run
+                # so the policy learns the task rather than one row of it.
+                instance = instances.next_batch()[0]
+                group = self._collect_group(
+                    job, client, cancelled, step, group_index, policy_version, instance, launch
+                )
+                groups.append(group)
+
+            batch: list = []
+            advantage_values: list[float] = []
+            reward_values: list[float] = []
+            completion_tokens = 0
+            for summaries, rewards in groups:
+                advantages = normalize_group_rewards(rewards)
+                advantage_values.extend(advantages)
+                reward_values.extend(rewards)
+                for summary, advantage in zip(summaries, advantages, strict=True):
+                    for action in summary.actions:
+                        datum, completions = _datum_from_action(
+                            Datum, action, advantage, sequence_cap=job.config.sequence_cap
+                        )
+                        batch.append(datum)
+                        completion_tokens += completions
+            if not batch or completion_tokens == 0:
+                raise RuntimeError("cispo_empty_training_batch")
+
+            weighted_loss = 0.0
+            tokens = 0.0
+            metrics: dict[str, object] = {}
+            for start in range(0, len(batch), job.config.micro_batch_size):
+                self._cancel_boundary(cancelled)
+                micro = batch[start : start + job.config.micro_batch_size]
+                forward = engine.forward_backward(
+                    ForwardBackwardRequest(
+                        data=micro,
+                        loss_fn=job.config.objective,
+                        eps_low=job.config.eps_low,
+                        eps_high=job.config.eps_high,
+                    )
+                )
+                micro_tokens = float(forward.metrics.get("token_count", 0.0))
+                weighted_loss += float(forward.loss) * micro_tokens
+                tokens += micro_tokens
+                metrics = dict(forward.metrics)
+            engine.optim_step(optimizer)
+
+            self._record_step(
+                job.job_id,
+                step,
+                loss=weighted_loss / tokens if tokens else 0.0,
+                tokens=tokens,
+                seconds=time.monotonic() - started,
+                epoch=1,
+                memory=_mlx_peak_memory(),
+                extra={
+                    "objective": job.config.objective,
+                    "policy_version": policy_version,
+                    "rollouts": len(reward_values),
+                    "reward_mean": fmean(reward_values),
+                    "reward_std": pstdev(reward_values),
+                    "advantage_mean": fmean(advantage_values),
+                    "advantage_std": pstdev(advantage_values),
+                    "clip_fraction": metrics.get("clip_fraction"),
+                    "mean_ratio": metrics.get("mean_ratio"),
+                    "completion_tokens": completion_tokens,
+                },
+            )
+            if step % job.config.checkpoint_every == 0 or step == job.config.max_steps:
+                saved = engine.save_checkpoint(f"{job.job_id}-step-{step:06d}")
+                self._adapter_checkpoint(job.job_id, step, Path(saved.path))
+
+        trained = self._heldout_reward(job, client, cancelled, "trained", launch)
+        self._record_policy_evaluation(job.job_id, baseline, trained)
+
+    def _heldout_reward(
+        self, job: Job, client, cancelled: threading.Event, phase: str, launch: str
+    ) -> dict:
+        """Mean reward over the frozen held-out instances, greedily sampled.
+
+        Greedy, because this is a measurement and not a search: temperature is
+        what makes training groups differ, and letting it vary here would report
+        sampling noise as a change in the policy. Same instances before and
+        after, so the comparison is paired.
+        """
+
+        target = job.config.rollout
+        assert target is not None
+        rewards: list[float] = []
+        for index in range(target.heldout_instances):
+            self._cancel_boundary(cancelled)
+            summary = client.rollout(
+                job_id=job.job_id,
+                attempt_id=f"{job.job_id}-eval-{phase}",
+                policy_version=f"{phase}",
+                rollout_id=f"{job.job_id}-{launch}-eval-{phase}-{index}",
+                task_instance_id=f"seed:{index}",
+                world_ref=target.heldout_world_ref,
+                temperature=0.01,
+            )
+            rewards.append(summary.reward)
+        outcome = {
+            "phase": phase,
+            "instances": len(rewards),
+            "mean_reward": fmean(rewards) if rewards else 0.0,
+            "rewards": rewards,
+        }
+        self.store.append_event(job.job_id, "heldout_eval.completed", outcome)
+        return outcome
+
+    def _record_policy_evaluation(self, job_id: str, baseline, trained) -> None:
+        job = self.store.load_job(job_id)
+        before = float((baseline or {}).get("mean_reward") or 0.0)
+        after = float((trained or {}).get("mean_reward") or 0.0)
+        wins = sum(
+            1
+            for b, a in zip((baseline or {}).get("rewards", []), trained.get("rewards", []))
+            if a > b
+        )
+        losses = sum(
+            1
+            for b, a in zip((baseline or {}).get("rewards", []), trained.get("rewards", []))
+            if a < b
+        )
+        job.evaluation = {
+            **job.evaluation,
+            "status": "completed",
+            "baseline": baseline,
+            "trained": trained,
+            "mean_reward_before": before,
+            "mean_reward_after": after,
+            "uplift": after - before,
+            "instances_improved": wins,
+            "instances_regressed": losses,
+        }
+        job.updated_at = utc_now()
+        self.store.save_job(job)
+        self.store.append_event(
+            job_id,
+            "evaluation.completed",
+            {
+                "mean_reward_before": before,
+                "mean_reward_after": after,
+                "uplift": after - before,
+                "instances_improved": wins,
+                "instances_regressed": losses,
+            },
+        )
+
+    def _collect_group(
+        self,
+        job: Job,
+        client,
+        cancelled: threading.Event,
+        step: int,
+        group_index: int,
+        policy_version: str,
+        instance: int,
+        launch: str,
+    ):
+        """One group with a usable signal, or a failure that says why.
+
+        A group whose rewards are all equal defines no preference and is
+        resampled rather than trained on. Hosted emits `rollout.group_filtered`
+        with reason `zero_advantage` and eventually raises
+        `cispo_no_learning_signal`; so does this.
+        """
+
+        for attempt in range(1, job.config.signal_attempts + 1):
+            self._cancel_boundary(cancelled)
+            summaries = []
+            for member in range(job.config.group_size):
+                summary = client.rollout(
+                    job_id=job.job_id,
+                    attempt_id=f"{job.job_id}-s{step:04d}-g{group_index}-a{attempt}",
+                    policy_version=policy_version,
+                    rollout_id=f"{job.job_id}-{launch}-s{step:04d}-g{group_index}-a{attempt}-r{member}",
+                    task_instance_id=f"seed:{instance}",
+                    world_ref=job.config.rollout.train_world_ref,
+                )
+                summaries.append(summary)
+                self.store.append_event(
+                    job.job_id,
+                    "rollout.completed",
+                    {
+                        "step": step,
+                        "rollout_id": summary.rollout_id,
+                        "policy_version": policy_version,
+                        "reward": summary.reward,
+                        "container_digest": summary.container_digest,
+                    },
+                )
+            rewards = [summary.reward for summary in summaries]
+            if has_learning_signal(rewards):
+                return summaries, rewards
+            self.store.append_event(
+                job.job_id,
+                "rollout.group_filtered",
+                {
+                    "step": step,
+                    "group": group_index,
+                    "reason": "zero_advantage",
+                    "signal_attempt": attempt,
+                    "instance": instance,
+                    "rewards": rewards,
+                },
+            )
+        raise RuntimeError("cispo_no_learning_signal")
+
     @staticmethod
     def _qwen_losses(engine: TrainingEngine, datums: list) -> list[float]:
         losses = []
@@ -514,6 +872,7 @@ class TrainingRunner:
         seconds: float,
         epoch: int,
         memory: int | None,
+        extra: dict[str, object] | None = None,
     ) -> None:
         job = self.store.load_job(job_id)
         job.current_step = step
@@ -533,6 +892,7 @@ class TrainingRunner:
             "tokens_per_second": tokens / seconds if seconds > 0 else 0.0,
             "memory_bytes": memory,
             "timestamp": utc_now(),
+            **(extra or {}),
         }
         self.store.append_metric(job_id, metric)
         self.store.append_event(job_id, "training.metric", metric)

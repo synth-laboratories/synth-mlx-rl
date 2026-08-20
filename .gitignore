@@ -10,3 +10,8 @@ build/
 # Local real-run artifacts (adapters are tens of MB)
 .real-sft-run*/
 .synth-mlx-rl/
+
+.banking77/
+.run-uplift/
+.cispo-run/
+.probe-svc/
