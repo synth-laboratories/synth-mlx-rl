@@ -1,7 +1,12 @@
 """GSM8K training lab: baseline -> SFT or CISPO -> held-out eval, on real MLX.
 
-Reward and data come from the container's own world module, so the training
-loop and the container agree by construction rather than by convention.
+Data comes from a dataset directory written by `scripts/gsm8k_sft_dataset.py`
+(digest-named JSONL from the pinned `openai/gsm8k` revision, with a manifest),
+and the reward parser comes from the container's own world module via an
+explicit `--containers-src`, so the loop and the container agree by
+construction rather than by convention. Nothing here reads a dataset path or a
+source switch from the environment; the manifest's pin is recorded on every
+archived run.
 
 The loop publishes a snapshot after every optimizer step. `resolve(None)`
 returns the newest PUBLISHED snapshot and `optim_step` publishes nothing, so a
@@ -16,52 +21,83 @@ from pathlib import Path
 sys.path.insert(0, "scripts"); sys.path.insert(0, "src")
 import mlx_guard
 
-CONTAINERS = Path.home() / "Documents/GitHub/containers-mlx-local-rl-20260818/src"
-sys.path.insert(0, str(CONTAINERS))
-os.environ.setdefault("SYNTH_GSM8K_SOURCE", "hf")
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
-
-from synth_containers.platform.gsm8k_world import (  # noqa: E402
-    HELDOUT_SPLIT, SOLVE_SYSTEM, TRAIN_SPLIT, load_row, parse_answer, user_prompt,
-)
 from synth_mlx_rl.config import Settings  # noqa: E402
 from synth_mlx_rl.engine import MLXEngine  # noqa: E402
 from synth_mlx_rl.mismatch import MismatchPolicy, measure_mismatch  # noqa: E402
-from synth_mlx_rl.objectives import group_normalize_rewards  # noqa: E402
+from synth_mlx_rl.rewards import group_normalize_rewards  # noqa: E402
 from synth_mlx_rl.schemas import (  # noqa: E402
     AdamParams, Datum, ForwardBackwardRequest, SampleRequest,
 )
 from synth_mlx_rl.store import AdapterStore, StoreConfig  # noqa: E402
 
 
-def messages(question: str) -> list[dict]:
-    return [{"role": "system", "content": SOLVE_SYSTEM},
-            {"role": "user", "content": user_prompt(question)}]
+class Example:
+    """One row of the dataset script's JSONL: the container's prompt + gold."""
+
+    def __init__(self, record: dict, parse_answer) -> None:
+        roles = [m["role"] for m in record["messages"]]
+        if roles != ["system", "user", "assistant"]:
+            raise SystemExit(f"unexpected message roles {roles}; not a gsm8k_sft_dataset row")
+        self.prompt = record["messages"][:2]
+        self.answer_text = record["messages"][2]["content"]
+        parsed = parse_answer(self.answer_text)
+        if not parsed.parsed:
+            raise SystemExit("a reference answer does not parse; refusing to train on it")
+        self.gold = parsed.value
 
 
-def sample(engine, question, *, n, temperature, max_tokens, snapshot):
+def load_parser(containers_src: Path):
+    sys.path.insert(0, str(containers_src.resolve()))
+    from synth_containers.platform.gsm8k_world import parse_answer  # noqa: E402
+
+    return parse_answer
+
+
+def load_dataset_dir(dataset: Path, parse_answer) -> tuple[dict, list[Example], list[Example]]:
+    manifest = json.loads((dataset / "manifest.json").read_text(encoding="utf-8"))
+    if manifest.get("schema_version") != "gsm8k.sft-dataset.v1":
+        raise SystemExit(f"{dataset}/manifest.json is not a gsm8k.sft-dataset.v1 manifest")
+    if not manifest["dataset"].get("revision"):
+        raise SystemExit("the dataset manifest carries no revision; refusing an unpinned set")
+
+    def read(label: str) -> list[Example]:
+        import hashlib
+        entry = manifest["files"][label]
+        payload = (dataset / entry["path"]).read_bytes()
+        digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+        if digest != entry["sha256"]:
+            raise SystemExit(f"{entry['path']} does not match its manifest digest; refusing")
+        return [Example(json.loads(line), parse_answer)
+                for line in payload.decode("utf-8").splitlines() if line.strip()]
+
+    return manifest, read("train"), read("eval")
+
+
+def sample(engine, prompt, *, n, temperature, max_tokens, snapshot):
     return engine.sample(SampleRequest(
-        messages=messages(question), num_samples=n, max_tokens=max_tokens,
+        messages=prompt, num_samples=n, max_tokens=max_tokens,
         temperature=temperature, top_p=1.0, top_k=0, min_p=0.0,
         policy_snapshot_id=snapshot))
 
 
-def reward(text: str, gold: str) -> float:
-    parsed = parse_answer(text)
-    # An unparseable completion is a failed attempt, not an absent signal.
-    return 1.0 if parsed.parsed and parsed.value == gold else 0.0
+def make_reward(parse_answer):
+    def reward(text: str, gold: str) -> float:
+        parsed = parse_answer(text)
+        # An unparseable completion is a failed attempt, not an absent signal.
+        return 1.0 if parsed.parsed and parsed.value == gold else 0.0
+    return reward
 
 
-def evaluate(engine, seeds, *, max_tokens, snapshot, label) -> float:
+def evaluate(engine, examples, *, reward, max_tokens, snapshot, label) -> float:
     hits = 0
     t0 = time.time()
-    for seed in seeds:
-        row = load_row(HELDOUT_SPLIT, seed)
-        out = sample(engine, row.question, n=1, temperature=0.0,
+    for ex in examples:
+        out = sample(engine, ex.prompt, n=1, temperature=0.0,
                      max_tokens=max_tokens, snapshot=snapshot)
-        hits += reward(out.samples[0].text, row.answer)
-    accuracy = hits / len(seeds)
-    print(f"  [{label}] held-out {hits}/{len(seeds)} = {accuracy:.4f}  ({time.time()-t0:.0f}s)", flush=True)
+        hits += reward(out.samples[0].text, ex.gold)
+    accuracy = hits / len(examples)
+    print(f"  [{label}] held-out {hits}/{len(examples)} = {accuracy:.4f}  "
+          f"({time.time()-t0:.0f}s)", flush=True)
     return accuracy
 
 
@@ -78,7 +114,7 @@ def completion_datum(prompt_ids, completion_ids, *, behavior=None, advantage=Non
                  weights=[0.0] * pad + [1.0] * n, **kwargs)
 
 
-def archive(engine, *, run_id, step, mode, baseline, final, store_root) -> str | None:
+def archive(engine, *, run_id, step, mode, baseline, final, store_root, dataset) -> str | None:
     """Checkpoint the adapter into the content-addressed store with provenance.
 
     The digest is the identity on all three surfaces (D10), so an adapter that
@@ -97,7 +133,7 @@ def archive(engine, *, run_id, step, mode, baseline, final, store_root) -> str |
         base_model=engine.settings.model)
     run = store.open_run(run_id, {
         "base_model": engine.settings.model, "algorithm": mode,
-        "lora_rank": engine.settings.lora_rank, "dataset": "openai/gsm8k",
+        "lora_rank": engine.settings.lora_rank, "dataset": dataset,
         "baseline_accuracy": baseline, "final_accuracy": final})
     run.checkpoint(step=step, adapter_digest=record.digest,
                    metrics={"heldout_accuracy": final, "baseline_accuracy": baseline})
@@ -133,22 +169,40 @@ def main() -> int:
                     help="collected SFT traces, reused instead of re-sampled")
     ap.add_argument("--rounds", type=int, default=8, help="cispo collection rounds")
     ap.add_argument("--out", default="")
+    ap.add_argument("--dataset", type=Path, required=True,
+                    help="directory written by scripts/gsm8k_sft_dataset.py")
+    ap.add_argument("--containers-src", type=Path, default=Path("../containers/src"),
+                    help="the containers checkout whose parser scores the rollouts")
     args = ap.parse_args()
     if args.lr is None:
         args.lr = 1e-4 if args.mode == "sft" else 1e-5
 
+    parse_answer = load_parser(args.containers_src)
+    reward = make_reward(parse_answer)
+    manifest, train_examples, eval_examples = load_dataset_dir(args.dataset, parse_answer)
+    eval_examples = eval_examples[:args.eval_n]
+    if len(eval_examples) < args.eval_n:
+        raise SystemExit(f"dataset holds {len(eval_examples)} eval rows; "
+                         f"--eval-n {args.eval_n} asked")
+    if len(train_examples) < args.train_prompts:
+        raise SystemExit(f"dataset holds {len(train_examples)} train rows; "
+                         f"--train-prompts {args.train_prompts} asked")
+    pin = manifest["dataset"]
+
     mlx_guard.install(3.0)
     engine = MLXEngine(Settings(lora_rank=8, max_seq_length=1600))
     base_snapshot = refresh(engine)
-    eval_seeds = list(range(args.eval_n))
 
     print(f"GSM8K {args.mode}  model={engine.settings.model}  lora r={engine.settings.lora_rank}")
-    print(f"eval seeds 0..{args.eval_n-1} (fixed, shared by every arm)\n")
-    baseline = evaluate(engine, eval_seeds, max_tokens=args.max_tokens,
+    print(f"dataset {pin['dataset']} @ {pin['revision'][:12]}  "
+          f"train {manifest['files']['train']['path']}  eval {manifest['files']['eval']['path']}")
+    print(f"eval rows 0..{len(eval_examples)-1} of the held-out file "
+          "(fixed, shared by every arm)\n")
+    baseline = evaluate(engine, eval_examples, reward=reward, max_tokens=args.max_tokens,
                         snapshot=base_snapshot, label="baseline")
 
     rng = random.Random(20260818)
-    train_seeds = rng.sample(range(1000), args.train_prompts)
+    train_rows = rng.sample(train_examples, args.train_prompts)
     history = []
 
     if args.mode == "sft":
@@ -172,18 +226,17 @@ def main() -> int:
         print(f"\ncollecting: {args.train_prompts} train prompts x {args.group} samples, temp=0.8")
         accepted, seen, t0 = [], 0, time.time()
         rows = []
-        for i, seed in enumerate(train_seeds):
-            row = load_row(TRAIN_SPLIT, seed)
-            out = sample(engine, row.question, n=args.group, temperature=0.8,
+        for i, row in enumerate(train_rows):
+            out = sample(engine, row.prompt, n=args.group, temperature=0.8,
                          max_tokens=args.max_tokens, snapshot=base_snapshot)
             for s in out.samples:
                 seen += 1
-                if reward(s.text, row.answer) == 1.0:
+                if reward(s.text, row.gold) == 1.0:
                     accepted.append(completion_datum(s.prompt_token_ids, s.completion_token_ids))
                     rows.append({"prompt_ids": list(s.prompt_token_ids),
                                  "completion_ids": list(s.completion_token_ids)})
             if (i + 1) % 16 == 0:
-                print(f"  {i+1}/{len(train_seeds)} prompts, {len(accepted)}/{seen} accepted "
+                print(f"  {i+1}/{len(train_rows)} prompts, {len(accepted)}/{seen} accepted "
                       f"({time.time()-t0:.0f}s)", flush=True)
         print(f"  accepted {len(accepted)}/{seen} traces "
               f"({len(accepted)/max(seen,1):.1%})", flush=True)
@@ -239,7 +292,7 @@ def main() -> int:
                     print(f"  step {step:3d}  loss {fb.loss:.4f}  "
                           f"{step_tokens/max(time.time()-t_step,1e-9):.0f} train tok/s", flush=True)
         snapshot = refresh(engine)
-        final = evaluate(engine, eval_seeds, max_tokens=args.max_tokens,
+        final = evaluate(engine, eval_examples, reward=reward, max_tokens=args.max_tokens,
                          snapshot=snapshot, label="after sft")
         tps = train_tokens / max(train_seconds, 1e-9)
         print(f"  training: {step} steps, {train_tokens} weighted tokens, "
@@ -253,13 +306,12 @@ def main() -> int:
         snapshot = base_snapshot
         step = 0
         for round_index in range(args.rounds):
-            prompts = train_seeds[round_index * 8:(round_index + 1) * 8] or train_seeds[:8]
+            prompts = train_rows[round_index * 8:(round_index + 1) * 8] or train_rows[:8]
             datums, rewards_seen, refused = [], [], 0
-            for seed in prompts:
-                row = load_row(TRAIN_SPLIT, seed)
-                out = sample(engine, row.question, n=args.group, temperature=1.0,
+            for row in prompts:
+                out = sample(engine, row.prompt, n=args.group, temperature=1.0,
                              max_tokens=args.max_tokens, snapshot=snapshot)
-                rewards = [reward(s.text, row.answer) for s in out.samples]
+                rewards = [reward(s.text, row.gold) for s in out.samples]
                 advantages = group_normalize_rewards(rewards)
                 rewards_seen.extend(rewards)
                 for s, adv in zip(out.samples, advantages):
@@ -292,13 +344,14 @@ def main() -> int:
                   f"datums={len(datums)} refused={refused} steps={step}", flush=True)
             history.append({"round": round_index, "train_reward": mean_reward,
                             "datums": len(datums), "refused": refused})
-        final = evaluate(engine, eval_seeds, max_tokens=args.max_tokens,
+        final = evaluate(engine, eval_examples, reward=reward, max_tokens=args.max_tokens,
                          snapshot=snapshot, label="after cispo")
 
     digest = archive(engine, run_id=f"gsm8k-{args.mode}-{int(time.time())}",
                      step=history[-1].get("steps", len(history)) if history else 0,
                      mode=args.mode, baseline=baseline, final=final,
-                     store_root=os.environ.get("SYNTH_MLX_RL_STORE", "~/.synth/mlx-rl"))
+                     store_root=os.environ.get("SYNTH_MLX_RL_STORE", "~/.synth/mlx-rl"),
+                     dataset={**pin, "files": manifest["files"]})
 
     uplift = final - baseline
     print(f"\n{'='*58}")
@@ -310,7 +363,9 @@ def main() -> int:
         Path(args.out).write_text(json.dumps(
             {"mode": args.mode, "baseline": baseline, "final": final, "uplift": uplift,
              "eval_n": args.eval_n, "adapter_digest": digest, "history": history,
-             "args": vars(args)}, indent=2))
+             "dataset": {**pin, "files": manifest["files"]},
+             "args": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}},
+            indent=2))
     return 0
 
 

@@ -112,7 +112,7 @@ def test_mismatch_closes_the_lifecycle_in_one_round_trip(client) -> None:
     sampled = client.post(
         "/v1/chat/completions",
         json={
-            "model": "fake/Qwen3.5-0.8B",
+            "model": "Qwen/Qwen3.5-0.8B",
             "messages": [{"role": "user", "content": "hello"}],
             "max_tokens": 8,
         },
@@ -161,7 +161,7 @@ def test_mismatch_thresholds_are_caller_settable(client) -> None:
     sampled = client.post(
         "/v1/chat/completions",
         json={
-            "model": "fake/Qwen3.5-0.8B",
+            "model": "Qwen/Qwen3.5-0.8B",
             "messages": [{"role": "user", "content": "hi"}],
             "max_tokens": 4,
         },
@@ -176,3 +176,42 @@ def test_mismatch_thresholds_are_caller_settable(client) -> None:
     # rather than silently staying `ok`.
     assert strict.json()["report"]["verdict"] == "correct_with_tis"
     assert strict.json()["tis_weights"] is not None
+
+
+def test_register_policy_is_idempotent_and_refuses_a_missing_dir(client, tmp_path) -> None:
+    missing = client.post(
+        "/v1/synth/policies/register",
+        json={"policy_dir": str(tmp_path / "nope"), "snapshot_id": "snap_missing"},
+    )
+    assert missing.status_code == 404
+    assert missing.json()["detail"]["error_code"] == "policy_dir_not_found"
+
+    policy_dir = tmp_path / "adapter"
+    policy_dir.mkdir()
+    (policy_dir / "policy.json").write_text(
+        '{"schema_version":"eval.mlx-lora-policy.v1","base_model":"Qwen/Qwen3.5-0.8B","adapter":false,"chat_template_digest":"sha256:'
+        + ("ab" * 32)
+        + '","thinking_mode":"off"}',
+        encoding="utf-8",
+    )
+    first = client.post(
+        "/v1/synth/policies/register",
+        json={
+            "policy_dir": str(policy_dir),
+            "snapshot_id": "snap_deadbeef",
+            "artifact_digest": "sha256:deadbeef",
+            "candidate_id": "policy_1",
+        },
+    )
+    assert first.status_code == 200, first.text
+    assert first.json()["policy_snapshot_id"] == "snap_deadbeef"
+    second = client.post(
+        "/v1/synth/policies/register",
+        json={
+            "policy_dir": str(policy_dir),
+            "snapshot_id": "snap_deadbeef",
+            "artifact_digest": "sha256:deadbeef",
+        },
+    )
+    assert second.status_code == 200
+    assert second.json()["policy_snapshot_id"] == "snap_deadbeef"

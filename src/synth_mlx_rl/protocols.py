@@ -19,9 +19,7 @@ from .snapshots import PolicySnapshot
 class LearnerEngine(Protocol):
     """What the HTTP layer needs from an engine.
 
-    Both :class:`synth_mlx_rl.engine.MLXEngine` and
-    :class:`synth_mlx_rl.testing.FakeEngine` satisfy this, which is what lets
-    the whole service be tested without MLX.
+    :class:`synth_mlx_rl.engine.MLXEngine` is the implementation.
     """
 
     renderer: Any
@@ -62,6 +60,16 @@ class LearnerEngine(Protocol):
     ) -> PolicySnapshot: ...
 
     def resolve_snapshot(self, snapshot_id: str | None) -> PolicySnapshot: ...
+
+    def register_policy(
+        self,
+        *,
+        policy_dir: str | Any,
+        snapshot_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> PolicySnapshot: ...
+
+    def load_training_adapter(self, policy_dir: str | Any) -> None: ...
 
     def save_checkpoint(self, name: str) -> CheckpointResponse: ...
 

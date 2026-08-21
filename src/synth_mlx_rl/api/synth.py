@@ -43,6 +43,13 @@ class PublishSnapshotRequest(StrictModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class RegisterPolicyRequest(StrictModel):
+    policy_dir: str = Field(min_length=1)
+    snapshot_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9._:-]{1,128}$")
+    artifact_digest: str | None = None
+    candidate_id: str | None = None
+
+
 class SnapshotListResponse(StrictModel):
     snapshots: list[dict[str, Any]]
     capacity: int
@@ -143,6 +150,39 @@ def publish_snapshot(body: PublishSnapshotRequest, request: Request) -> dict[str
         )
     except SnapshotError as exc:
         raise snapshot_http_error(exc) from exc
+    return snapshot.describe()
+
+
+@router.post("/policies/register")
+def register_policy(body: RegisterPolicyRequest, request: Request) -> dict[str, Any]:
+    """Load a host-side mlx-lora candidate directory and freeze it.
+
+    Eval trials cannot carry adapter bytes into the container. The host
+    registers the directory and the trial is told only the snapshot id.
+    Re-registering the same id is idempotent.
+    """
+
+    engine = get_engine(request)
+    metadata = {
+        key: value
+        for key, value in {
+            "artifact_digest": body.artifact_digest,
+            "candidate_id": body.candidate_id,
+        }.items()
+        if value
+    }
+    try:
+        snapshot = engine.register_policy(
+            policy_dir=body.policy_dir,
+            snapshot_id=body.snapshot_id,
+            metadata=metadata,
+        )
+    except FileNotFoundError as exc:
+        raise http_error("policy_dir_not_found", str(exc), 404) from exc
+    except SnapshotError as exc:
+        raise snapshot_http_error(exc) from exc
+    except ValueError as exc:
+        raise http_error("invalid_request", str(exc), 400) from exc
     return snapshot.describe()
 
 

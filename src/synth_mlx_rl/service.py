@@ -28,6 +28,68 @@ def _memory_bytes() -> int | None:
         return None
 
 
+def _available_memory_bytes() -> int | None:
+    """Memory the allocator could actually get, not total installed."""
+
+    if platform.system() != "Darwin":
+        return None
+    try:
+        out = os.popen("vm_stat").read()
+    except OSError:
+        return None
+    page = 4096
+    reclaimable = 0
+    for line in out.splitlines():
+        if "page size of" in line:
+            page = int(line.split("page size of")[1].split("bytes")[0].strip())
+        key, _, value = line.partition(":")
+        value = value.strip().rstrip(".")
+        if key.strip() in {"Pages free", "Pages inactive", "Pages speculative"} and value.isdigit():
+            reclaimable += int(value)
+    return reclaimable * page or None
+
+
+#: Peak MLX allocation is approximately linear in the tokens of a single
+#: forward/backward pass. Fitted on this backend with gradient checkpointing on,
+#: Qwen3.5-0.8B rank-8: 758 tokens -> 15.54 GB, 3090 tokens -> 57.61 GB. That is
+#: 18.0 MB per token over a 1.9 GB resident floor. Without checkpointing the
+#: slope is roughly 42 MB/token, which is why it is not optional here.
+PEAK_BYTES_PER_TOKEN = 18_000_000
+RESIDENT_FLOOR_BYTES = 1_900_000_000
+#: Leave the machine able to do something other than swap.
+MEMORY_HEADROOM_BYTES = 4 * 1024**3
+#: Rough bytes-per-token for chat text. Only used to size a refusal, and the
+#: estimate is reported so a caller can see what it was refused on.
+BYTES_PER_TOKEN_ESTIMATE = 3.5
+
+
+def _resident_model_matches(requested: str, resident: str) -> bool:
+    """Match the pinned model ID to its validated managed on-disk location."""
+
+    if requested == resident:
+        return True
+    managed = os.environ.get("SYNTH_MLX_RL_MODEL_PATH", "").strip()
+    if not managed or requested != "Qwen/Qwen3.5-0.8B":
+        return False
+    try:
+        return Path(resident).expanduser().resolve() == Path(managed).expanduser().resolve()
+    except OSError:
+        return False
+
+
+def estimated_peak_bytes(*, dataset_bytes: int, rows: int, micro_batch_size: int,
+                         max_seq_length: int) -> int:
+    """What one forward/backward over a micro-batch is expected to peak at."""
+
+    if rows <= 0:
+        return RESIDENT_FLOOR_BYTES
+    tokens_per_row = min(
+        float(max_seq_length), (dataset_bytes / rows) / BYTES_PER_TOKEN_ESTIMATE
+    )
+    tokens = tokens_per_row * min(micro_batch_size, rows)
+    return int(RESIDENT_FLOOR_BYTES + PEAK_BYTES_PER_TOKEN * tokens)
+
+
 class LocalTrainingService:
     def __init__(
         self,
@@ -35,11 +97,17 @@ class LocalTrainingService:
         settings: Settings,
         engine_provider=None,
         qwen_available_override: bool | None = None,
+        sampler_base_url: str = "http://127.0.0.1:8787",
     ) -> None:
         self.store = JobStore(root)
         self.settings = settings
         self.qwen_available_override = qwen_available_override
-        self.runner = TrainingRunner(self.store, engine_provider)
+        self.sampler_base_url = sampler_base_url.rstrip("/")
+        self.runner = TrainingRunner(
+            self.store,
+            engine_provider,
+            sampler_url=f"{sampler_base_url.rstrip('/')}/v1/training/sample",
+        )
         self.recovered_jobs = self.store.recover_interrupted()
 
     def capabilities(self) -> Capabilities:
@@ -68,15 +136,6 @@ class LocalTrainingService:
                     supported=apple_silicon,
                     reason=None if apple_silicon else "requires macOS arm64",
                 ),
-                "fixture_training": Capability(supported=True),
-                "mlx_scalar_smoke": Capability(
-                    supported=apple_silicon and mlx_available,
-                    reason=(
-                        None
-                        if apple_silicon and mlx_available
-                        else "MLX unavailable or unsupported platform"
-                    ),
-                ),
                 "qwen_lora_training": Capability(
                     supported=qwen_available,
                     reason=(
@@ -85,9 +144,21 @@ class LocalTrainingService:
                         else "Qwen LoRA requires Apple Silicon, mlx, and mlx-lm"
                     ),
                 ),
-                "automatic_resume": Capability(
-                    supported=False,
-                    reason="optimizer state is not yet durable",
+                "cispo_training": Capability(
+                    supported=qwen_available,
+                    reason=(
+                        None
+                        if qwen_available
+                        else "the on-policy lane needs the same MLX stack as SFT"
+                    ),
+                ),
+                "resume_from_checkpoint": Capability(
+                    supported=qwen_available,
+                    reason=(
+                        None
+                        if qwen_available
+                        else "resume needs the same engine that wrote the checkpoint"
+                    ),
                 ),
                 "tinker_training_subset": Capability(
                     supported=False,
@@ -109,17 +180,22 @@ class LocalTrainingService:
     def preflight(self, request: ConfigureRequest) -> Preflight:
         config = request.config
         checks: dict[str, Capability] = {}
-        dataset = Path(config.dataset.path).expanduser()
-        if dataset.is_file():
-            dataset_digest = sha256_file(dataset)
-            digest_matches = config.dataset.sha256 in {None, dataset_digest}
-            checks["dataset"] = Capability(
-                supported=digest_matches,
-                reason=None if digest_matches else "dataset sha256 does not match file bytes",
-            )
-        else:
-            dataset_digest = None
-            checks["dataset"] = Capability(supported=False, reason="dataset path is not a file")
+        # The on-policy lane has no dataset: its data is the rollouts it
+        # collects, so a dataset check there would refuse a valid config.
+        dataset = Path(config.dataset.path).expanduser() if config.dataset else None
+        dataset_digest = None
+        if dataset is not None:
+            if dataset.is_file():
+                dataset_digest = sha256_file(dataset)
+                digest_matches = config.dataset.sha256 in {None, dataset_digest}
+                checks["dataset"] = Capability(
+                    supported=digest_matches,
+                    reason=None if digest_matches else "dataset sha256 does not match file bytes",
+                )
+            else:
+                checks["dataset"] = Capability(
+                    supported=False, reason="dataset path is not a file"
+                )
         if config.evaluation_dataset is not None:
             evaluation_dataset = Path(config.evaluation_dataset.path).expanduser()
             evaluation_digest = (
@@ -146,27 +222,94 @@ class LocalTrainingService:
         while not output_parent.exists() and output_parent != output_parent.parent:
             output_parent = output_parent.parent
         free = shutil.disk_usage(output_parent).free
-        estimated = max(1024 * 1024, dataset.stat().st_size * 3 if dataset.is_file() else 0)
+        dataset_on_disk = dataset is not None and dataset.is_file()
+        estimated = max(1024 * 1024, dataset.stat().st_size * 3 if dataset_on_disk else 0)
         disk_needed = min(config.max_disk_bytes, estimated)
         checks["disk"] = Capability(
             supported=free >= disk_needed,
             reason=None if free >= disk_needed else f"need {disk_needed} bytes; have {free}",
         )
-        capability_name = {
-            "fixture": "fixture_training",
-            "mlx_scalar_smoke": "mlx_scalar_smoke",
-            "qwen_lora": "qwen_lora_training",
-        }[config.backend]
-        capability = self.capabilities().capabilities[capability_name]
-        if config.backend == "qwen_lora" and config.base_model != "Qwen/Qwen3.5-0.8B":
+        # Memory, not disk, is what actually ends a run on this hardware, and it
+        # scales with the tokens in one forward pass -- so it is a function of
+        # micro_batch_size, never of dataset size. A full-batch config that would
+        # peak past the machine is refused here rather than discovered by
+        # watching the allocator thrash.
+        rows = 0
+        dataset_bytes = 0
+        if dataset_on_disk:
+            dataset_bytes = dataset.stat().st_size
+            rows = sum(1 for line in dataset.read_text(encoding="utf-8").splitlines() if line.strip())
+        if config.backend == "cispo":
+            # A rollout's length is bounded by the prompt plus `max_tokens`, and
+            # a micro-batch holds that many sequences.
+            rows = max(1, config.micro_batch_size)
+            dataset_bytes = int(
+                rows * config.rollout.max_tokens * 2 * BYTES_PER_TOKEN_ESTIMATE
+            )
+        estimated = estimated_peak_bytes(
+            dataset_bytes=dataset_bytes,
+            rows=rows,
+            micro_batch_size=config.micro_batch_size,
+            max_seq_length=config.max_seq_length,
+        )
+        available = _available_memory_bytes()
+        budget = None if available is None else available - MEMORY_HEADROOM_BYTES
+        checks["memory"] = Capability(
+            supported=budget is None or estimated <= budget,
+            reason=(
+                None
+                if budget is None or estimated <= budget
+                else (
+                    f"a micro-batch of {config.micro_batch_size} row(s) is estimated to peak at "
+                    f"{estimated / 1024**3:.1f} GB, and only {available / 1024**3:.1f} GB is "
+                    f"available. Lower micro_batch_size -- batch_size can stay where it is, "
+                    f"because accumulation makes them independent."
+                )
+            ),
+        )
+        if config.backend == "cispo":
+            # Spend-free: ask the container what it can do before any rollout
+            # runs. An on-policy step that discovers its environment is
+            # unreachable has already published a snapshot and burned a step.
+            from synth_mlx_rl.rollout_client import ContainerRolloutClient, RolloutError
+
+            assert config.rollout is not None
+            probe = ContainerRolloutClient(
+                base_url=config.rollout.url,
+                task_id=config.rollout.task_id,
+                sampler_url=f"{self.sampler_base_url}/v1/training/sample",
+                sampler_token="preflight",
+                bearer_token=config.rollout.bearer_token,
+                timeout_seconds=15.0,
+            )
+            try:
+                advertised = probe.capabilities()
+            except RolloutError as exc:
+                checks["rollout"] = Capability(supported=False, reason=str(exc))
+            else:
+                room = int(advertised.get("max_concurrency") or 0)
+                checks["rollout"] = Capability(
+                    supported=room >= 1,
+                    reason=(
+                        None
+                        if room >= 1
+                        else "container advertises no rollout concurrency"
+                    ),
+                )
+
+        capability = self.capabilities().capabilities[
+            "cispo_training" if config.backend == "cispo" else "qwen_lora_training"
+        ]
+        if config.base_model != "Qwen/Qwen3.5-0.8B":
             capability = Capability(
                 supported=False,
                 reason="v0.6 local SFT supports exactly Qwen/Qwen3.5-0.8B",
             )
-        if config.backend == "qwen_lora" and (
-            config.base_model != self.settings.model
+        if (
+            not _resident_model_matches(config.base_model, self.settings.model)
             or config.lora_rank != self.settings.lora_rank
             or config.lora_alpha != self.settings.lora_alpha
+            or config.lora_dropout != self.settings.lora_dropout
             or config.max_seq_length != self.settings.max_seq_length
             or config.enable_thinking != self.settings.enable_thinking
         ):
@@ -228,6 +371,7 @@ def create_app(
     *,
     settings: Settings | None = None,
     engine=None,
+    sampler_base_url: str = "http://127.0.0.1:8787",
 ) -> FastAPI:
     root_path = Path(root).expanduser().resolve()
     configured = (settings or Settings.from_env()).with_overrides(
@@ -244,6 +388,7 @@ def create_app(
         configured,
         lambda: app.state.engine,
         qwen_available_override=True if engine is not None else None,
+        sampler_base_url=sampler_base_url,
     )
     app.state.service = service
 
@@ -286,6 +431,66 @@ def create_app(
     def launch(job_id: str) -> Job:
         try:
             return service.runner.launch(job_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="job not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/v1/training/sample")
+    def training_sample(body: dict) -> dict:
+        """The sampler leg of the on-policy lane, in the hosted shape.
+
+        A task container does not speak this service's OpenAI surface; it speaks
+        the hosted sampler contract, because that is what the cloud lane hands
+        it. Serving the same shape locally is what lets one unmodified container
+        drive either lane.
+
+        Sampling runs with truncation disabled -- no top-p, no top-k, no min-p.
+        That is deliberate: `rollout_logprobs` are read from the full next-token
+        distribution, so with truncation off they *are* log pi(a|s) under the
+        pinned policy, which is the ratio denominator CISPO needs. Truncated
+        sampling would return values from a distribution the trainer never had,
+        and the importance ratio would quietly compare two different policies.
+        """
+
+        from synth_mlx_rl.schemas import ChatMessage, SampleRequest
+
+        messages = body.get("messages")
+        if not isinstance(messages, list) or not messages:
+            raise HTTPException(status_code=422, detail="messages are required")
+        try:
+            request = SampleRequest(
+                messages=[ChatMessage.model_validate(item) for item in messages],
+                max_tokens=int(body.get("max_tokens") or 128),
+                temperature=float(body.get("temperature") or 0.0),
+                top_p=1.0,
+                top_k=0,
+                min_p=0.0,
+                num_samples=1,
+                policy_snapshot_id=body.get("policy_snapshot_id"),
+            )
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        sample = app.state.engine.sample(request).samples[0]
+        return {
+            "schema_version": "training.rollout.action.v1",
+            "text": sample.text,
+            "prompt_token_ids": sample.prompt_token_ids,
+            "token_ids": sample.completion_token_ids,
+            "log_probs": sample.rollout_logprobs,
+            "policy_version": sample.policy_snapshot_id,
+            "usage": {
+                "prompt_tokens": len(sample.prompt_token_ids),
+                "completion_tokens": len(sample.completion_token_ids),
+                "total_tokens": len(sample.prompt_token_ids)
+                + len(sample.completion_token_ids),
+            },
+        }
+
+    @app.post("/v1/jobs/{job_id}/resume", response_model=Job, status_code=202)
+    def resume(job_id: str) -> Job:
+        try:
+            return service.runner.resume(job_id)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="job not found") from exc
         except ValueError as exc:
@@ -344,22 +549,17 @@ def create_app(
         if not job.checkpoints:
             raise HTTPException(status_code=409, detail="no checkpoint is available")
         checkpoint = job.checkpoints[-1]
-        qwen_lora = job.config.backend == "qwen_lora"
         evaluation = dict(job.evaluation)
         if "status" not in evaluation:
             evaluation.update(
                 status="not_run",
-                reason=(
-                    "evaluation dataset was not configured"
-                    if qwen_lora
-                    else "fixture/smoke backends do not create a deployable model"
-                ),
+                reason="evaluation dataset was not configured",
             )
         return Handoff(
             job_id=job_id,
             checkpoint=checkpoint,
             inference={
-                "kind": "mlx-lora.v1" if qwen_lora else "non_inference_smoke_checkpoint",
+                "kind": "mlx-lora.v1",
                 "path": checkpoint.path,
                 "requested_base_model": job.config.base_model,
             },

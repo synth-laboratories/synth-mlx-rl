@@ -68,6 +68,43 @@ class RenderedPrompt:
     render_digest: str
 
 
+def _template_message(message: dict[str, Any]) -> dict[str, Any]:
+    """Adapt one wire message to what a chat template expects.
+
+    On the wire `tool_calls[].function.arguments` is a JSON *string*, because
+    that is the OpenAI format this service is compatible with. Qwen's chat
+    template iterates it as a mapping, so a replayed tool-calling conversation
+    raises `Can only get item pairs from a mapping` from inside Jinja -- a
+    message that names neither the field nor the conversation. Parse it here and
+    leave the wire format alone.
+    """
+
+    tool_calls = message.get("tool_calls")
+    if not isinstance(tool_calls, list):
+        return message
+    adapted = []
+    for call in tool_calls:
+        function = call.get("function") if isinstance(call, dict) else None
+        arguments = function.get("arguments") if isinstance(function, dict) else None
+        if not isinstance(arguments, str):
+            adapted.append(call)
+            continue
+        try:
+            parsed = json.loads(arguments)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"tool call {call.get('id') or function.get('name')!r} has arguments that "
+                f"are not valid JSON, and a chat template cannot render them: {exc}"
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise ValueError(
+                f"tool call {call.get('id') or function.get('name')!r} has arguments that "
+                "are valid JSON but not an object; a chat template needs named arguments"
+            )
+        adapted.append({**call, "function": {**function, "arguments": parsed}})
+    return {**message, "tool_calls": adapted}
+
+
 class Renderer:
     """Renders canonical messages to tokens, once, for every surface."""
 
@@ -119,7 +156,8 @@ class Renderer:
             self._default_enable_thinking if enable_thinking is None else enable_thinking
         )
         conversation = [
-            message.model_dump(exclude_none=True) for message in messages
+            _template_message(message.model_dump(exclude_none=True))
+            for message in messages
         ]
         tool_payload = (
             [tool.model_dump(exclude_none=True) for tool in tools] if tools else None

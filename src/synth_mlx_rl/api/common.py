@@ -181,18 +181,32 @@ def token_text_deltas(
     Cumulative decoding rather than per-token decoding, because a token is not
     guaranteed to be a whole character: decoding one at a time turns multi-byte
     text into replacement characters.
+
+    Cumulative decoding alone is not enough. When a multi-byte character
+    straddles two tokens, the decode after the first one ends in U+FFFD, and
+    once that has been yielded it cannot be taken back -- the completed
+    character that arrives next is the same length, so the naive "only emit
+    what grew" rule emits nothing and the stream keeps a replacement character
+    the non-streamed response does not have. A trailing U+FFFD is therefore
+    held back until a later token completes it, and flushed at the end if the
+    model genuinely emitted one.
     """
 
     emitted = ""
     prefix: list[int] = []
+    text = ""
     for token_id in completion_token_ids:
         prefix.append(int(token_id))
         text = engine.decode(prefix, skip_special_tokens=True)
-        if text.startswith(emitted) and len(text) > len(emitted):
-            yield text[len(emitted) :]
-            emitted = text
-        elif text != emitted:
+        stable = text.rstrip("\ufffd")
+        if stable == emitted:
+            continue
+        if stable.startswith(emitted):
+            yield stable[len(emitted) :]
+        else:
             # A detokenizer that rewrote earlier text: re-emit from scratch
             # rather than pretending the earlier bytes were right.
-            yield text[len(emitted) :] if len(text) > len(emitted) else ""
-            emitted = text
+            yield stable[len(emitted) :] if len(stable) > len(emitted) else ""
+        emitted = stable
+    if len(text) > len(emitted) and text.startswith(emitted):
+        yield text[len(emitted) :]

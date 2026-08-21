@@ -1,39 +1,83 @@
-"""Wire and durability tests that run without MLX or a model download."""
+"""Wire and durability tests for the one real backend.
+
+There is no fixture or smoke backend to test against: the service offers
+`qwen_lora` and nothing else, and these tests drive it with the real resident
+MLX engine. There is no fake engine to fall back to: the whole job state machine
+-- preflight, configure, launch, metrics, cancel, checkpoint, handoff, reopen --
+runs against a model that is actually loaded.
+
+Every client is entered as a context manager: the engine binds in the app
+lifespan, so a client that never starts has no engine and every job fails.
+"""
 
 from __future__ import annotations
 
-import hashlib
 import json
 import time
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 
 import pytest
 from fastapi.testclient import TestClient
 
 from synth_mlx_rl.config import Settings
-from synth_mlx_rl.service import create_app
-from synth_mlx_rl.testing import FakeEngine
+from synth_mlx_rl.service import _resident_model_matches, create_app
+from synth_mlx_rl.storage import sha256_path
+
+RESIDENT = dict(
+    model="Qwen/Qwen3.5-0.8B",
+    lora_rank=8,
+    lora_alpha=16.0,
+    max_seq_length=1024,
+    enable_thinking=False,
+)
 
 
-def _payload(tmp_path: Path, *, job_id: str = "fixture-run", steps: int = 3) -> dict[str, object]:
-    dataset = tmp_path / "data.jsonl"
+def test_managed_model_path_retains_the_pinned_logical_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    managed = tmp_path / "models" / "Qwen" / "Qwen3.5-0.8B"
+    managed.mkdir(parents=True)
+    monkeypatch.setenv("SYNTH_MLX_RL_MODEL_PATH", str(managed))
+
+    assert _resident_model_matches("Qwen/Qwen3.5-0.8B", str(managed))
+    assert not _resident_model_matches("Qwen/another-model", str(managed))
+    assert not _resident_model_matches("Qwen/Qwen3.5-0.8B", str(tmp_path / "other"))
+
+
+@contextmanager
+def _client(root: Path, tmp_path: Path) -> Iterator[TestClient]:
+    """A service whose only backend is real, driven by a fake engine."""
+    settings = Settings(checkpoint_dir=tmp_path / "adapters", **RESIDENT)
+    with TestClient(create_app(root, settings=settings)) as client:
+        yield client
+
+
+def _payload(tmp_path: Path, *, job_id: str = "local-run", steps: int = 3) -> dict[str, object]:
+    dataset = tmp_path / f"data-{job_id}.jsonl"
     dataset.write_text('{"prompt":"2+2","completion":"4"}\n')
     return {
         "job_id": job_id,
         "config": {
-            "backend": "fixture",
+            "backend": "qwen_lora",
+            "base_model": RESIDENT["model"],
             "dataset": {"path": str(dataset)},
             "output_dir": str(tmp_path / f"output-{job_id}"),
             "max_steps": steps,
             "checkpoint_every": 2,
-            "learning_rate": 0.1,
+            "learning_rate": 5e-5,
+            "lora_rank": RESIDENT["lora_rank"],
+            "lora_alpha": RESIDENT["lora_alpha"],
+            "max_seq_length": RESIDENT["max_seq_length"],
+            "enable_thinking": RESIDENT["enable_thinking"],
             "seed": 3,
         },
     }
 
 
 def _wait_for_terminal(client: TestClient, job_id: str) -> dict[str, object]:
-    for _ in range(100):
+    for _ in range(400):
         response = client.get(f"/v1/jobs/{job_id}")
         response.raise_for_status()
         job = response.json()
@@ -43,121 +87,118 @@ def _wait_for_terminal(client: TestClient, job_id: str) -> dict[str, object]:
     raise AssertionError("job did not become terminal")
 
 
+def test_the_service_offers_exactly_one_backend(tmp_path: Path) -> None:
+    with _client(tmp_path / "service", tmp_path) as client:
+        capabilities = client.get("/v1/capabilities").json()["capabilities"]
+    # A backend that cannot produce a deployable model is not offered at all.
+    assert "fixture_training" not in capabilities
+    assert "mlx_scalar_smoke" not in capabilities
+    assert capabilities["qwen_lora_training"]["supported"] is True
+
+
+def test_an_unknown_backend_is_refused_at_the_wire(tmp_path: Path) -> None:
+    with _client(tmp_path / "service", tmp_path) as client:
+        payload = _payload(tmp_path)
+        payload["config"]["backend"] = "fixture"  # type: ignore[index]
+        assert client.post("/v1/jobs/preflight", json=payload).status_code == 422
+        assert client.post("/v1/jobs", json=payload).status_code == 422
+
+
 def test_preflight_rejects_missing_dataset(tmp_path: Path) -> None:
-    client = TestClient(create_app(tmp_path / "service"))
-    payload = _payload(tmp_path)
-    payload["config"]["dataset"]["path"] = str(tmp_path / "missing.jsonl")  # type: ignore[index]
+    with _client(tmp_path / "service", tmp_path) as client:
+        payload = _payload(tmp_path)
+        payload["config"]["dataset"]["path"] = str(tmp_path / "missing.jsonl")  # type: ignore[index]
 
-    response = client.post("/v1/jobs/preflight", json=payload)
+        response = client.post("/v1/jobs/preflight", json=payload)
 
-    assert response.status_code == 200
-    assert response.json()["accepted"] is False
-    assert response.json()["checks"]["dataset"]["supported"] is False
-    assert client.post("/v1/jobs", json=payload).status_code == 422
+        assert response.status_code == 200
+        assert response.json()["accepted"] is False
+        assert response.json()["checks"]["dataset"]["supported"] is False
+        assert client.post("/v1/jobs", json=payload).status_code == 422
 
 
 def test_preflight_rejects_dataset_digest_mismatch(tmp_path: Path) -> None:
-    client = TestClient(create_app(tmp_path / "service"))
-    payload = _payload(tmp_path)
-    payload["config"]["dataset"]["sha256"] = "0" * 64  # type: ignore[index]
+    with _client(tmp_path / "service", tmp_path) as client:
+        payload = _payload(tmp_path)
+        payload["config"]["dataset"]["sha256"] = "0" * 64  # type: ignore[index]
 
-    preflight = client.post("/v1/jobs/preflight", json=payload).json()
+        preflight = client.post("/v1/jobs/preflight", json=payload).json()
 
     assert preflight["accepted"] is False
     assert "does not match" in preflight["checks"]["dataset"]["reason"]
 
 
-def test_fixture_job_has_live_metrics_terminal_digest_and_durable_handoff(tmp_path: Path) -> None:
+def test_job_has_live_metrics_terminal_digest_and_durable_handoff(tmp_path: Path) -> None:
     root = tmp_path / "service"
-    client = TestClient(create_app(root))
     payload = _payload(tmp_path)
+    with _client(root, tmp_path) as client:
+        preflight = client.post("/v1/jobs/preflight", json=payload).json()
+        assert preflight["accepted"] is True
+        assert client.post("/v1/jobs", json=payload).status_code == 201
+        assert client.post("/v1/jobs/local-run/launch").status_code == 202
 
-    preflight = client.post("/v1/jobs/preflight", json=payload).json()
-    assert preflight["accepted"] is True
-    configured = client.post("/v1/jobs", json=payload)
-    assert configured.status_code == 201
-    assert client.post("/v1/jobs/fixture-run/launch").status_code == 202
+        job = _wait_for_terminal(client, "local-run")
+        assert job["status"] == "succeeded"
+        assert job["current_step"] == 3
+        assert len(job["checkpoints"]) == 2
+        terminal = job["checkpoints"][-1]
+        checkpoint = Path(terminal["path"])
+        # The checkpoint is an adapter directory; the digest covers the tree.
+        assert (checkpoint / "adapters.safetensors").is_file()
+        assert sha256_path(checkpoint)[0] == terminal["sha256"]
 
-    job = _wait_for_terminal(client, "fixture-run")
-    assert job["status"] == "succeeded"
-    assert job["current_step"] == 3
-    assert len(job["checkpoints"]) == 2
-    terminal = job["checkpoints"][-1]
-    checkpoint = Path(terminal["path"])
-    assert hashlib.sha256(checkpoint.read_bytes()).hexdigest() == terminal["sha256"]
+        events = client.get("/v1/jobs/local-run/events").json()["events"]
+        assert any(event["type"] == "training.metric" for event in events)
+        assert events[-1]["type"] == "job.succeeded"
+        assert len((root / "local-run" / "metrics.jsonl").read_text().splitlines()) == 3
 
-    events = client.get("/v1/jobs/fixture-run/events").json()["events"]
-    assert any(event["type"] == "training.metric" for event in events)
-    assert events[-1]["type"] == "job.succeeded"
-    assert len((root / "fixture-run" / "metrics.jsonl").read_text().splitlines()) == 3
+        handoff = client.get("/v1/jobs/local-run/handoff")
+        assert handoff.status_code == 200
+        assert handoff.json()["checkpoint"]["sha256"] == terminal["sha256"]
+        assert handoff.json()["inference"]["kind"] == "mlx-lora.v1"
+        assert handoff.json()["evaluation"]["status"] == "not_run"
 
-    handoff = client.get("/v1/jobs/fixture-run/handoff")
-    assert handoff.status_code == 200
-    assert handoff.json()["checkpoint"]["sha256"] == terminal["sha256"]
-    assert handoff.json()["inference"]["kind"] == "non_inference_smoke_checkpoint"
-    assert handoff.json()["evaluation"]["status"] == "not_run"
-
-    reopened = TestClient(create_app(root))
-    reopened_job = reopened.get("/v1/jobs/fixture-run").json()
-    assert reopened_job["status"] == "succeeded"
-    assert reopened.get("/v1/jobs/fixture-run/handoff").json()["checkpoint"] == terminal
+    with _client(root, tmp_path) as reopened:
+        reopened_job = reopened.get("/v1/jobs/local-run").json()
+        assert reopened_job["status"] == "succeeded"
+        assert reopened.get("/v1/jobs/local-run/handoff").json()["checkpoint"] == terminal
 
 
 def test_restart_marks_active_job_interrupted_without_claiming_resume(tmp_path: Path) -> None:
     root = tmp_path / "service"
-    client = TestClient(create_app(root))
     payload = _payload(tmp_path, job_id="recover-me")
-    assert client.post("/v1/jobs", json=payload).status_code == 201
+    with _client(root, tmp_path) as client:
+        assert client.post("/v1/jobs", json=payload).status_code == 201
 
     job_path = root / "recover-me" / "job.json"
     job = json.loads(job_path.read_text())
     job["status"] = "running"
     job_path.write_text(json.dumps(job))
 
-    reopened = TestClient(create_app(root))
-    recovered = reopened.get("/v1/jobs/recover-me").json()
-    assert recovered["status"] == "interrupted"
-    assert recovered["resume_supported"] is False
-    assert recovered["error_code"] == "service_restarted"
-    assert reopened.get("/healthz").json()["recovered_jobs"] == ["recover-me"]
+    with _client(root, tmp_path) as reopened:
+        recovered = reopened.get("/v1/jobs/recover-me").json()
+        assert recovered["status"] == "interrupted"
+        assert recovered["resume_supported"] is False
+        assert recovered["error_code"] == "service_restarted"
+        assert reopened.get("/healthz").json()["recovered_jobs"] == ["recover-me"]
 
 
 def test_cancellation_is_terminal_and_keeps_completed_artifacts(tmp_path: Path) -> None:
     root = tmp_path / "service"
-    client = TestClient(create_app(root))
-    payload = _payload(tmp_path, job_id="cancel-me", steps=1_000)
-    assert client.post("/v1/jobs", json=payload).status_code == 201
-    assert client.post("/v1/jobs/cancel-me/launch").status_code == 202
+    payload = _payload(tmp_path, job_id="cancel-me", steps=10_000)
+    with _client(root, tmp_path) as client:
+        assert client.post("/v1/jobs", json=payload).status_code == 201
+        assert client.post("/v1/jobs/cancel-me/launch").status_code == 202
 
-    for _ in range(100):
-        status = client.get("/v1/jobs/cancel-me").json()["status"]
-        if status in {"running", "cancelling"}:
-            break
-        time.sleep(0.01)
-    assert client.post("/v1/jobs/cancel-me/cancel").status_code == 202
-    job = _wait_for_terminal(client, "cancel-me")
-    assert job["status"] == "cancelled"
-    assert (root / "cancel-me" / "events.jsonl").exists()
-
-
-@pytest.mark.mlx
-def test_mlx_compute_smoke_records_real_peak_memory(tmp_path: Path) -> None:
-    pytest.importorskip("mlx.core")
-    root = tmp_path / "service"
-    client = TestClient(create_app(root))
-    payload = _payload(tmp_path, job_id="mlx-smoke", steps=2)
-    payload["config"]["backend"] = "mlx_scalar_smoke"  # type: ignore[index]
-    assert client.post("/v1/jobs/preflight", json=payload).json()["accepted"] is True
-    assert client.post("/v1/jobs", json=payload).status_code == 201
-    assert client.post("/v1/jobs/mlx-smoke/launch").status_code == 202
-
-    job = _wait_for_terminal(client, "mlx-smoke")
-    assert job["status"] == "succeeded"
-    metrics = [
-        json.loads(line) for line in (root / "mlx-smoke" / "metrics.jsonl").read_text().splitlines()
-    ]
-    assert len(metrics) == 2
-    assert all(isinstance(metric["memory_bytes"], int) for metric in metrics)
+        for _ in range(200):
+            status = client.get("/v1/jobs/cancel-me").json()["status"]
+            if status in {"running", "cancelling"}:
+                break
+            time.sleep(0.01)
+        assert client.post("/v1/jobs/cancel-me/cancel").status_code == 202
+        job = _wait_for_terminal(client, "cancel-me")
+        assert job["status"] == "cancelled"
+        assert (root / "cancel-me" / "events.jsonl").exists()
 
 
 def test_qwen_lora_job_persists_real_adapter_contract_and_render_lineage(
@@ -172,7 +213,6 @@ def test_qwen_lora_job_persists_real_adapter_contract_and_render_lineage(
         max_seq_length=1024,
         enable_thinking=False,
     )
-    engine = FakeEngine(checkpoint_dir=root / "adapters")
     dataset = tmp_path / "qwen.jsonl"
     dataset.write_text(
         '{"messages":[{"role":"user","content":"Say ready"},'
@@ -199,7 +239,7 @@ def test_qwen_lora_job_persists_real_adapter_contract_and_render_lineage(
             "enable_thinking": False,
         },
     }
-    with TestClient(create_app(root, settings=settings, engine=engine)) as client:
+    with TestClient(create_app(root, settings=settings)) as client:
         capabilities = client.get("/v1/capabilities").json()
         assert capabilities["qwen_lora_contract"] == {
             "backend": "qwen_lora",
@@ -237,7 +277,6 @@ def test_qwen_preflight_fails_closed_on_resident_render_contract_mismatch(
     tmp_path: Path,
 ) -> None:
     settings = Settings(model="Qwen/Qwen3.5-0.8B", lora_rank=8, max_seq_length=1024)
-    engine = FakeEngine(checkpoint_dir=tmp_path / "adapters")
     payload = _payload(tmp_path, job_id="mismatch")
     payload["config"].update(  # type: ignore[union-attr]
         {
@@ -249,7 +288,7 @@ def test_qwen_preflight_fails_closed_on_resident_render_contract_mismatch(
             "enable_thinking": False,
         }
     )
-    with TestClient(create_app(tmp_path / "service", settings=settings, engine=engine)) as client:
+    with TestClient(create_app(tmp_path / "service", settings=settings)) as client:
         preflight = client.post("/v1/jobs/preflight", json=payload).json()
     assert preflight["accepted"] is False
     assert "do not match the resident service" in preflight["checks"]["backend"]["reason"]

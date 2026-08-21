@@ -230,6 +230,7 @@ class MLXEngine(EngineBase):
         # request arrives, or the first /v1/sample would have to read mutable
         # weights -- which is the failure D2 exists to prevent.
         self.publish_snapshot(metadata={"reason": "initial"})
+        self._base_adapter = self._capture_adapter()
 
     # -- adapters and snapshots ------------------------------------------
 
@@ -255,6 +256,52 @@ class MLXEngine(EngineBase):
 
     def _load_adapter(self, payload: dict[str, Any]) -> None:
         self.model.update(self.tree_unflatten(list(payload.items())))
+
+    def load_training_adapter(self, policy_dir: Path) -> None:
+        """Replace the mutable training adapter from a retained artifact."""
+
+        payload = self._policy_payload(policy_dir)
+        with self._lock:
+            self._activate(None)
+            self._load_adapter(payload)
+            self.mx.eval(self.model.parameters())
+
+    def _policy_payload(self, policy_dir: Path) -> dict[str, Any]:
+        """Load adapter bytes from an Eval/Workshop candidate directory.
+
+        ``adapter: false`` freezes the untrained base LoRA so the baseline arm
+        is a snapshot, not ambient latest. Adapter-carrying directories load
+        ``adapters.safetensors`` without mutating the live training adapter.
+        """
+
+        policy: dict[str, Any] = {}
+        manifest = policy_dir / "policy.json"
+        if manifest.is_file():
+            policy = json.loads(manifest.read_text(encoding="utf-8"))
+        wants_adapter = policy.get("adapter")
+        if wants_adapter is None:
+            wants_adapter = (policy_dir / "adapters.safetensors").is_file()
+        with self._lock:
+            self._activate(None)
+            if not wants_adapter:
+                if self._base_adapter is None:
+                    return self._capture_adapter()
+                return {
+                    name: self.mx.array(value)
+                    for name, value in self._base_adapter.items()
+                }
+            adapter_file = policy_dir / "adapters.safetensors"
+            if not adapter_file.is_file():
+                raise FileNotFoundError(
+                    f"mlx-lora candidate is missing adapters.safetensors: {policy_dir}"
+                )
+            stashed = self._capture_adapter()
+            self.model.load_weights(str(adapter_file), strict=False)
+            self.mx.eval(self.model.parameters())
+            payload = self._capture_adapter()
+            self._load_adapter(stashed)
+            self.mx.eval(self.model.parameters())
+            return payload
 
     def _activate(self, snapshot: PolicySnapshot | None) -> None:
         """Swap the adapter the resident model is holding.

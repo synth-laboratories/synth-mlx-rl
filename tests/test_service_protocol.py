@@ -9,7 +9,6 @@ from __future__ import annotations
 import pytest
 
 from synth_mlx_rl.api.app import create_app, mounted_paths
-from synth_mlx_rl.testing import FakeEngine
 
 
 def test_both_api_families_are_mounted(client) -> None:
@@ -18,7 +17,7 @@ def test_both_api_families_are_mounted(client) -> None:
     assert "/v1/responses" in paths
 
 
-def test_end_to_end_fake_protocol(client) -> None:
+def test_end_to_end_protocol(client) -> None:
     health = client.get("/healthz")
     assert health.status_code == 200
     assert health.json()["ok"] is True
@@ -42,7 +41,12 @@ def test_end_to_end_fake_protocol(client) -> None:
     )
 
     logprobs = client.post("/v1/synth/logprobs", json={"token_ids": [1, 2, 3]})
-    assert logprobs.json()["logprobs"] == [None, -0.25, -0.25]
+    scored = logprobs.json()["logprobs"]
+    # The first token has no predecessor to be scored against, and the rest are
+    # real log-probabilities. Their values belong to the model, not to this test.
+    assert scored[0] is None
+    assert len(scored) == 3
+    assert all(isinstance(value, float) and value < 0 for value in scored[1:])
 
     datum = {"input_ids": [1, 2, 3], "target_ids": [2, 3, 4], "weights": [0.0, 1.0, 1.0]}
     forward = client.post(
@@ -136,14 +140,17 @@ def test_accumulation_weight_is_a_global_token_total(client) -> None:
 
 
 def test_service_starts_without_importing_mlx() -> None:
-    """The whole portable suite depends on this: building the app imports no mlx.
+    """Constructing the app must not import mlx.
 
-    Checked in a subprocess, deliberately. Asserting on this process's
-    `sys.modules` is order-dependent -- once any MLX-marked test has run in the
-    same session, mlx is legitimately loaded and the assertion fails for a
-    reason that has nothing to do with the service. It would also pass
-    vacuously on a machine where mlx is not installed at all, which is the
-    machine least able to detect a regression here.
+    MLX streams are thread-affine, so the engine has to be BUILT on the worker
+    thread that will call it, not on whatever thread happens to construct the
+    app. An import at construction time is the first step towards building it
+    in the wrong place, and the failure it produces -- `There is no Stream(gpu,
+    N) in current thread` inside mx.eval -- points nowhere near the cause.
+
+    Checked in a subprocess, deliberately: asserting on this process's
+    `sys.modules` is order-dependent, because by the time this runs the session
+    engine has legitimately loaded mlx.
     """
 
     import subprocess
@@ -152,8 +159,7 @@ def test_service_starts_without_importing_mlx() -> None:
     probe = (
         "import sys;"
         "from synth_mlx_rl.api.app import create_app;"
-        "from synth_mlx_rl.testing.fake_engine import FakeEngine;"
-        "app = create_app(engine=FakeEngine());"
+        "app = create_app();"
         "assert app is not None;"
         "leaked = sorted(m for m in sys.modules if m.split('.')[0] in {'mlx', 'mlx_lm'});"
         "print('LEAKED:' + ','.join(leaked)) if leaked else print('CLEAN')"

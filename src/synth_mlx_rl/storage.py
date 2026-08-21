@@ -94,7 +94,24 @@ class JobStore:
                 for sequence, _line in enumerate(handle, start=1):
                     pass
             sequence += 1
-        event = Event(sequence=sequence, type=type_, timestamp=utc_now(), payload=payload or {})
+        now = utc_now()
+        event = Event(
+            sequence=sequence,
+            type=type_,
+            kind=type_,
+            timestamp=now,
+            occurred_at=now,
+            payload=payload or {},
+            schema_version="training.event.v1",
+            event_id=f"{job_id}:{sequence}",
+            job_id=job_id,
+            attempt_id="attempt-1",
+            producer={
+                "service": "synth-mlx-rl",
+                "version": "0.6.0",
+                "commit": "synth-mlx-rl",
+            },
+        )
         with events_path.open("a", encoding="utf-8") as handle:
             handle.write(event.model_dump_json() + "\n")
             handle.flush()
@@ -127,7 +144,11 @@ class JobStore:
                 job.status = JobStatus.INTERRUPTED
                 job.error_code = "service_restarted"
                 job.error_detail = (
-                    "The service restarted; automatic resume is unsupported for this backend."
+                    "The service restarted mid-run. Resume from the last checkpoint with "
+                    "POST /v1/jobs/{job_id}/resume, or leave it terminal."
+                    if job.checkpoints
+                    else "The service restarted before any checkpoint was written; there is "
+                    "nothing to resume from."
                 )
                 job.finished_at = utc_now()
                 job.updated_at = job.finished_at

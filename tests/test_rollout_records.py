@@ -20,7 +20,7 @@ def _record(**overrides):
         policy_snapshot_id="snap_1",
         training_version=3,
         api_family="chat_completions",
-        model="fake/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.5-0.8B",
         prompt_token_ids=[1, 2, 3],
         completion_token_ids=[4, 5],
         rollout_logprobs=[-0.1, -0.2],
