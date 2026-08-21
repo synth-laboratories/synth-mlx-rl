@@ -22,7 +22,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from synth_mlx_rl.config import Settings
-from synth_mlx_rl.service import create_app
+from synth_mlx_rl.service import _resident_model_matches, create_app
 from synth_mlx_rl.storage import sha256_path
 
 RESIDENT = dict(
@@ -32,6 +32,18 @@ RESIDENT = dict(
     max_seq_length=1024,
     enable_thinking=False,
 )
+
+
+def test_managed_model_path_retains_the_pinned_logical_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    managed = tmp_path / "models" / "Qwen" / "Qwen3.5-0.8B"
+    managed.mkdir(parents=True)
+    monkeypatch.setenv("SYNTH_MLX_RL_MODEL_PATH", str(managed))
+
+    assert _resident_model_matches("Qwen/Qwen3.5-0.8B", str(managed))
+    assert not _resident_model_matches("Qwen/another-model", str(managed))
+    assert not _resident_model_matches("Qwen/Qwen3.5-0.8B", str(tmp_path / "other"))
 
 
 @contextmanager
