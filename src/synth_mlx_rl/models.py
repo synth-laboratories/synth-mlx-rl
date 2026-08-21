@@ -81,6 +81,10 @@ class TrainingConfig(BaseModel):
 
     # --- on-policy lane -------------------------------------------------
     rollout: RolloutTarget | None = None
+    #: Optional retained mlx-lora adapter directory used to initialize a new
+    #: CISPO job.  Workshop records this path from a verified training artifact;
+    #: retaining it in the typed request prevents a silently cold-started run.
+    warm_start: str | None = None
     #: Rollouts per group. Two is the minimum that can define an advantage.
     group_size: int = Field(default=4, ge=2, le=64)
     groups_per_step: int = Field(default=1, ge=1, le=64)
@@ -122,10 +126,19 @@ class TrainingConfig(BaseModel):
             raise ValueError("output_dir must not be empty")
         return value
 
+    @field_validator("warm_start")
+    @classmethod
+    def warm_start_must_not_be_empty(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("warm_start must not be empty")
+        return value
+
     @model_validator(mode="after")
     def lane_requirements_are_met(self) -> "TrainingConfig":
         if self.backend == "qwen_lora" and self.dataset is None:
             raise ValueError("qwen_lora needs a dataset")
+        if self.backend != "cispo" and self.warm_start is not None:
+            raise ValueError("warm_start is supported only for cispo")
         if self.backend == "cispo":
             if self.rollout is None:
                 raise ValueError(

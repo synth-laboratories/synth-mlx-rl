@@ -122,3 +122,21 @@ def test_a_valid_on_policy_configuration_is_accepted() -> None:
     assert config.eps_low == 1.0 and config.eps_high == 4.0
     assert config.group_size >= 2
     assert config.dataset is None
+
+
+def test_a_cispo_warm_start_survives_wire_validation() -> None:
+    config = TrainingConfig(
+        backend="cispo",
+        output_dir="out",
+        rollout=RolloutTarget(url="http://127.0.0.1:8114", task_id="banking77"),
+        warm_start="/tmp/retained-adapter",
+    )
+    assert config.model_dump()["warm_start"] == "/tmp/retained-adapter"
+
+    with pytest.raises(ValueError, match="only for cispo"):
+        TrainingConfig(
+            backend="qwen_lora",
+            output_dir="out",
+            dataset={"path": "train.jsonl"},
+            warm_start="/tmp/retained-adapter",
+        )
