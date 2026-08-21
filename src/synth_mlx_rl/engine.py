@@ -257,6 +257,15 @@ class MLXEngine(EngineBase):
     def _load_adapter(self, payload: dict[str, Any]) -> None:
         self.model.update(self.tree_unflatten(list(payload.items())))
 
+    def load_training_adapter(self, policy_dir: Path) -> None:
+        """Replace the mutable training adapter from a retained artifact."""
+
+        payload = self._policy_payload(policy_dir)
+        with self._lock:
+            self._activate(None)
+            self._load_adapter(payload)
+            self.mx.eval(self.model.parameters())
+
     def _policy_payload(self, policy_dir: Path) -> dict[str, Any]:
         """Load adapter bytes from an Eval/Workshop candidate directory.
 

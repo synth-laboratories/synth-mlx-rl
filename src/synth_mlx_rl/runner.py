@@ -522,6 +522,13 @@ class TrainingRunner:
             engine.load_checkpoint(Path(job.checkpoints[-1].path).name)
             start_step = job.current_step + 1
         else:
+            if job.config.warm_start is not None:
+                engine.load_training_adapter(Path(job.config.warm_start))
+                self.store.append_event(
+                    job.job_id,
+                    "training.warm_start_loaded",
+                    {"path": job.config.warm_start},
+                )
             start_step = 1
 
         instances = _MinibatchStream(
