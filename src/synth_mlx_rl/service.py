@@ -19,6 +19,12 @@ from synth_mlx_rl.runner import TrainingRunner
 from synth_mlx_rl.storage import JobStore, canonical_json, sha256_bytes, sha256_file, utc_now
 
 
+class PreflightRejected(ValueError):
+    def __init__(self, preflight: Preflight) -> None:
+        super().__init__("preflight rejected the job")
+        self.preflight = preflight
+
+
 def _memory_bytes() -> int | None:
     if platform.system() != "Darwin":
         return None
@@ -340,7 +346,7 @@ class LocalTrainingService:
     def configure(self, request: ConfigureRequest) -> Job:
         preflight = self.preflight(request)
         if not preflight.accepted:
-            raise ValueError("preflight failed")
+            raise PreflightRejected(preflight)
         job_id = request.job_id or f"mlx-{uuid.uuid4().hex[:12]}"
         output = Path(request.config.output_dir).expanduser().resolve()
         if output.exists() and any(output.iterdir()):
@@ -413,6 +419,15 @@ def create_app(
     def configure(request: ConfigureRequest) -> Job:
         try:
             return service.configure(request)
+        except PreflightRejected as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "preflight_rejected",
+                    "message": str(exc),
+                    "preflight": exc.preflight.model_dump(mode="json"),
+                },
+            ) from exc
         except (ValueError, FileExistsError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 

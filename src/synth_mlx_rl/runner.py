@@ -223,6 +223,8 @@ class TrainingRunner:
                 JobStatus.INTERRUPTED,
             }:
                 return job
+            if job.status == JobStatus.CANCELLING:
+                return job
             event = self._cancel.get(job_id)
             if event is None:
                 raise ValueError("job is not owned by this service process and cannot be cancelled")
@@ -542,7 +544,12 @@ class TrainingRunner:
 
         baseline = job.evaluation.get("baseline")
         if not resuming:
-            baseline = self._heldout_reward(job, client, cancelled, "baseline", launch)
+            baseline_snapshot = engine.publish_snapshot(
+                metadata={"reason": "cispo_baseline", "job_id": job.job_id}
+            )
+            baseline = self._heldout_reward(
+                job, client, cancelled, "baseline", baseline_snapshot.id, launch
+            )
             job = self.store.load_job(job.job_id)
             job.evaluation = {**job.evaluation, "baseline": baseline}
             self.store.save_job(job)
@@ -653,11 +660,22 @@ class TrainingRunner:
                 saved = engine.save_checkpoint(f"{job.job_id}-step-{step:06d}")
                 self._adapter_checkpoint(job.job_id, step, Path(saved.path))
 
-        trained = self._heldout_reward(job, client, cancelled, "trained", launch)
+        trained_snapshot = engine.publish_snapshot(
+            metadata={"reason": "cispo_final", "job_id": job.job_id}
+        )
+        trained = self._heldout_reward(
+            job, client, cancelled, "trained", trained_snapshot.id, launch
+        )
         self._record_policy_evaluation(job.job_id, baseline, trained)
 
     def _heldout_reward(
-        self, job: Job, client, cancelled: threading.Event, phase: str, launch: str
+        self,
+        job: Job,
+        client,
+        cancelled: threading.Event,
+        phase: str,
+        policy_snapshot_id: str,
+        launch: str,
     ) -> dict:
         """Mean reward over the frozen held-out instances, greedily sampled.
 
@@ -675,7 +693,7 @@ class TrainingRunner:
             summary = client.rollout(
                 job_id=job.job_id,
                 attempt_id=f"{job.job_id}-eval-{phase}",
-                policy_version=f"{phase}",
+                policy_version=policy_snapshot_id,
                 rollout_id=f"{job.job_id}-{launch}-eval-{phase}-{index}",
                 task_instance_id=f"seed:{index}",
                 world_ref=target.heldout_world_ref,
@@ -761,6 +779,7 @@ class TrainingRunner:
             instance = instances.next_batch()[0]
             summaries = []
             for member in range(job.config.group_size):
+                self._cancel_boundary(cancelled)
                 summary = client.rollout(
                     job_id=job.job_id,
                     attempt_id=f"{job.job_id}-s{step:04d}-g{group_index}-a{attempt}",
