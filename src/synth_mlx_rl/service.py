@@ -63,6 +63,20 @@ MEMORY_HEADROOM_BYTES = 4 * 1024**3
 BYTES_PER_TOKEN_ESTIMATE = 3.5
 
 
+def _resident_model_matches(requested: str, resident: str) -> bool:
+    """Match the pinned model ID to its validated managed on-disk location."""
+
+    if requested == resident:
+        return True
+    managed = os.environ.get("SYNTH_MLX_RL_MODEL_PATH", "").strip()
+    if not managed or requested != "Qwen/Qwen3.5-0.8B":
+        return False
+    try:
+        return Path(resident).expanduser().resolve() == Path(managed).expanduser().resolve()
+    except OSError:
+        return False
+
+
 def estimated_peak_bytes(*, dataset_bytes: int, rows: int, micro_batch_size: int,
                          max_seq_length: int) -> int:
     """What one forward/backward over a micro-batch is expected to peak at."""
@@ -292,7 +306,7 @@ class LocalTrainingService:
                 reason="v0.6 local SFT supports exactly Qwen/Qwen3.5-0.8B",
             )
         if (
-            config.base_model != self.settings.model
+            not _resident_model_matches(config.base_model, self.settings.model)
             or config.lora_rank != self.settings.lora_rank
             or config.lora_alpha != self.settings.lora_alpha
             or config.lora_dropout != self.settings.lora_dropout
