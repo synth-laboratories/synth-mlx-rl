@@ -48,7 +48,7 @@ class RolloutTarget(BaseModel):
     #: group of identical greedy samples has no reward variance and the step is
     #: filtered, so the lane would never find a signal.
     temperature: float = Field(default=0.7, gt=0.0, le=2.0)
-    connection_mode: Literal["close", "keep_alive"] = "close"
+    connection_mode: Literal["close", "keep_alive"] = "keep_alive"
     #: Task instances to draw training groups from, as `seed:N` for N in range.
     train_instances: int = Field(default=64, ge=1, le=100_000)
     train_world_ref: str | None = None
@@ -78,9 +78,13 @@ class TrainingConfig(BaseModel):
     #: Required by `qwen_lora`; unused by `cispo`, whose data is its rollouts.
     dataset: DatasetSpec | None = None
     evaluation_dataset: DatasetSpec | None = None
+    #: Task identity for an SFT adapter intended to warm-start on-policy work.
+    task_id: str | None = None
 
     # --- on-policy lane -------------------------------------------------
     rollout: RolloutTarget | None = None
+    #: A succeeded qwen_lora job whose task_id must match rollout.task_id.
+    warm_start_job_id: str | None = None
     #: Rollouts per group. Two is the minimum that can define an advantage.
     group_size: int = Field(default=4, ge=2, le=64)
     groups_per_step: int = Field(default=1, ge=1, le=64)

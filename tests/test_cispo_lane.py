@@ -8,19 +8,24 @@ only one of them.
 
 from __future__ import annotations
 
+import json
 import math
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from synth_mlx_rl.models import RolloutTarget, TrainingConfig
+from synth_mlx_rl.models import Job, JobStatus, RolloutTarget, TrainingConfig
 from synth_mlx_rl.rewards import (
     RewardGroupError,
     has_learning_signal,
     normalize_group_rewards,
 )
-from synth_mlx_rl.rollout_client import RolloutAction, RolloutError
-from synth_mlx_rl.runner import _datum_from_action
+from synth_mlx_rl.rollout_client import ContainerRolloutClient, RolloutAction, RolloutError
+from synth_mlx_rl.runner import TrainingRunner, _MinibatchStream, _datum_from_action
 from synth_mlx_rl.schemas import Datum
+from synth_mlx_rl.storage import JobStore, utc_now
 
 
 def test_group_advantages_use_the_sample_standard_deviation() -> None:
@@ -122,3 +127,113 @@ def test_a_valid_on_policy_configuration_is_accepted() -> None:
     assert config.eps_low == 1.0 and config.eps_high == 4.0
     assert config.group_size >= 2
     assert config.dataset is None
+    assert config.rollout is not None
+    assert config.rollout.connection_mode == "keep_alive"
+
+
+def test_group_and_step_rollouts_overlap_in_flight(tmp_path) -> None:
+    """A sleeping container must see concurrent POSTs; a serial loop fails this."""
+
+    peak = {"current": 0, "max": 0}
+    lock = threading.Lock()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(length) or b"{}")
+            with lock:
+                peak["current"] += 1
+                peak["max"] = max(peak["max"], peak["current"])
+            time.sleep(0.2)
+            with lock:
+                peak["current"] -= 1
+            rollout_id = str(body.get("rollout_id") or "r")
+            reward = 1.0 if rollout_id.endswith("r0") else 0.0
+            payload = json.dumps(
+                {
+                    "schema_version": "training.rollout.summary.v1",
+                    "rollout_id": rollout_id,
+                    "reward": {"reward": reward},
+                    "actions": [
+                        {
+                            "prompt_token_ids": [1, 2],
+                            "token_ids": [3],
+                            "log_probs": [-0.1],
+                        }
+                    ],
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A003
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = server.server_address[1]
+        store = JobStore(tmp_path)
+        config = TrainingConfig(
+            backend="cispo",
+            output_dir=str(tmp_path / "out"),
+            rollout=RolloutTarget(
+                url=f"http://127.0.0.1:{port}",
+                task_id="t",
+                train_instances=8,
+            ),
+            group_size=2,
+            groups_per_step=2,
+            signal_attempts=1,
+        )
+        job = Job(
+            job_id="concurrentrollouts",
+            status=JobStatus.CONFIGURED,
+            config=config,
+            config_sha256="x",
+            dataset_sha256="x",
+            created_at=utc_now(),
+            updated_at=utc_now(),
+            metrics_path=str(tmp_path / "metrics.jsonl"),
+            events_path=str(tmp_path / "events.jsonl"),
+            manifest_path=str(tmp_path / "manifest.json"),
+        )
+        store.configure(job)
+        client = ContainerRolloutClient(
+            base_url=f"http://127.0.0.1:{port}",
+            task_id="t",
+            sampler_url="http://127.0.0.1:9/v1",
+            sampler_token="local",
+        )
+        try:
+            runner = TrainingRunner(store)
+            cancelled = threading.Event()
+            instances = _MinibatchStream(count=8, batch_size=1, shuffle=True, seed=0)
+            rollout_slots = threading.BoundedSemaphore(2)
+            groups, attempts = runner._collect_step_groups(
+                job,
+                client,
+                cancelled,
+                1,
+                "policy-v1",
+                instances,
+                "launch",
+                rollout_slots,
+            )
+            assert peak["max"] == 2
+            peak["max"] = 0
+            runner._heldout_reward(
+                job, client, cancelled, "baseline", "launch", rollout_slots, 2
+            )
+        finally:
+            client.close()
+        assert attempts >= 1
+        assert len(groups) == 2
+        assert peak["max"] == 2
+    finally:
+        server.shutdown()
+        server.server_close()

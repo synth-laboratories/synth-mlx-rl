@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from synth_mlx_rl.snapshots import (
+    SnapshotError,
     SnapshotEvictedError,
     SnapshotNotFoundError,
     SnapshotPool,
@@ -65,6 +66,46 @@ def test_explicit_eviction_is_also_a_tombstone() -> None:
     pool.evict(snapshot.id)
     with pytest.raises(SnapshotEvictedError):
         pool.get(snapshot.id)
+
+
+def test_caller_supplied_digest_may_be_republished_after_eviction() -> None:
+    pool = SnapshotPool(capacity=1)
+    digest = "sha256:" + "ab" * 32
+    pool.publish(
+        payload={"w": 1.0},
+        training_version=1,
+        step=1,
+        base_model="Qwen/Qwen3.5-0.8B",
+        lora_rank=8,
+        lora_scale=2.0,
+        tokenizer_digest="tok",
+        template_digest="tpl",
+        snapshot_id=digest,
+    )
+    _publish(pool, 2)
+    with pytest.raises(SnapshotEvictedError):
+        pool.get(digest)
+    restored = pool.publish(
+        payload={"w": 3.0},
+        training_version=3,
+        step=3,
+        base_model="Qwen/Qwen3.5-0.8B",
+        lora_rank=8,
+        lora_scale=2.0,
+        tokenizer_digest="tok",
+        template_digest="tpl",
+        snapshot_id=digest,
+    )
+    assert restored.id == digest
+    assert pool.get(digest).training_version == 3
+
+
+def test_random_ids_cannot_reuse_an_evicted_id() -> None:
+    pool = SnapshotPool(capacity=1, id_factory=lambda: "snap_fixed")
+    snapshot = _publish(pool, 1)
+    pool.evict(snapshot.id)
+    with pytest.raises(SnapshotError):
+        _publish(pool, 2)
 
 
 def test_a_published_snapshot_is_a_copy_not_an_alias(engine) -> None:

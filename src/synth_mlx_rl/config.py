@@ -19,6 +19,47 @@ DEFAULT_MODEL = "Qwen/Qwen3.5-0.8B"
 ENV_PREFIX = "SYNTH_MLX_RL_"
 
 
+def _valid_model_directory(path: Path) -> bool:
+    """Whether ``path`` contains the files MLX-LM needs for this model."""
+
+    path = path.expanduser()
+    return (
+        path.is_dir()
+        and (path / "config.json").is_file()
+        and (path / "tokenizer_config.json").is_file()
+        and (
+            any(path.glob("*.safetensors"))
+            or any(path.glob("*.bin"))
+        )
+    )
+
+
+def _cached_model_directory(model: str) -> Path | None:
+    """Resolve an already-downloaded HF snapshot without contacting the Hub."""
+
+    cache_root = Path(
+        os.getenv("HF_HUB_CACHE")
+        or Path(os.getenv("HF_HOME", "~/.cache/huggingface")).expanduser() / "hub"
+    ).expanduser()
+    repository = cache_root / ("models--" + model.replace("/", "--"))
+    snapshots = repository / "snapshots"
+    reference = repository / "refs" / "main"
+    candidates: list[Path] = []
+    if reference.is_file():
+        revision = reference.read_text(encoding="utf-8").strip()
+        if revision:
+            candidates.append(snapshots / revision)
+    if snapshots.is_dir():
+        candidates.extend(
+            sorted(
+                (path for path in snapshots.iterdir() if path.is_dir()),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+        )
+    return next((path.resolve() for path in candidates if _valid_model_directory(path)), None)
+
+
 def _env(name: str) -> str | None:
     return os.getenv(ENV_PREFIX + name)
 
@@ -50,6 +91,9 @@ def parse_lora_keys(values: Iterable[str] | None) -> tuple[str, ...] | None:
 @dataclass(frozen=True, slots=True)
 class Settings:
     model: str = DEFAULT_MODEL
+    #: Workshop-managed HF snapshot. This is a load location, never a second
+    #: model identity: the admitted policy remains ``DEFAULT_MODEL``.
+    model_path: Path | None = None
     checkpoint_dir: Path = Path("./checkpoints")
     adapter_path: Path | None = None
     lora_rank: int = 8
@@ -81,6 +125,8 @@ class Settings:
         return self.lora_alpha / self.lora_rank
 
     def validated(self) -> "Settings":
+        if self.model != DEFAULT_MODEL:
+            raise ValueError(f"the bounded recipe admits exactly {DEFAULT_MODEL}")
         if self.lora_rank <= 0:
             raise ValueError("lora_rank must be positive")
         if self.lora_alpha <= 0:
@@ -99,12 +145,33 @@ class Settings:
             raise ValueError("max_rollout_records must be at least 1")
         return self
 
+    def local_model_path(self) -> Path | None:
+        """Prefer Workshop's managed snapshot, then an existing HF cache."""
+
+        if self.model_path is not None:
+            managed = self.model_path.expanduser()
+            if _valid_model_directory(managed):
+                return managed.resolve()
+        return _cached_model_directory(self.model)
+
+    def require_local_model_path(self) -> Path:
+        path = self.local_model_path()
+        if path is None:
+            raise FileNotFoundError(
+                f"{DEFAULT_MODEL} is not available locally. Download it in "
+                "Workshop Settings → Models → On-device training, then pass "
+                f"{ENV_PREFIX}MODEL_PATH as the downloaded snapshot directory."
+            )
+        return path
+
     @classmethod
     def from_env(cls) -> "Settings":
         adapter = _env("ADAPTER_PATH")
+        model_path = _env("MODEL_PATH")
         keys = _env("LORA_KEYS")
         return cls(
             model=_env("MODEL") or DEFAULT_MODEL,
+            model_path=Path(model_path) if model_path else None,
             checkpoint_dir=Path(_env("CHECKPOINT_DIR") or "./checkpoints"),
             adapter_path=Path(adapter) if adapter else None,
             lora_rank=_env_int("LORA_RANK", 8),

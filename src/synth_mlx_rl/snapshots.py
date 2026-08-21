@@ -121,8 +121,14 @@ class SnapshotPool:
 
         with self._lock:
             new_id = snapshot_id or self._id_factory()
-            if new_id in self._snapshots or new_id in self._evicted:
+            if new_id in self._snapshots:
                 raise SnapshotError(f"policy_snapshot_id {new_id!r} is already in use")
+            # Caller-supplied digest ids may be republished after eviction: the
+            # identity is the bytes, so restoring them is not a mutation.
+            if new_id in self._evicted:
+                if snapshot_id is None:
+                    raise SnapshotError(f"policy_snapshot_id {new_id!r} is already in use")
+                self._evicted.discard(new_id)
             snapshot = PolicySnapshot(
                 id=new_id,
                 training_version=training_version,

@@ -92,3 +92,58 @@ def test_exactly_one_of_engine_or_factory() -> None:
         SingleThreadEngine(_ThreadRecorder(), factory=_ThreadRecorder)
     with pytest.raises(ValueError, match="exactly one"):
         SingleThreadEngine()
+
+
+def test_concurrent_same_prompt_samples_become_one_generate_batch() -> None:
+    """Two num_samples=1 calls that share a prompt must merge into generate_batch."""
+
+    from synth_mlx_rl.schemas import Sample, SampleRequest, SampleResponse
+
+    class _BatchRecorder:
+        def __init__(self) -> None:
+            self.generate_batch_calls = 0
+            self.sample_widths: list[int] = []
+
+        def generate_batch(self, token_ids, request):
+            self.generate_batch_calls += 1
+            return [([7], [-0.2], "stop")] * request.num_samples
+
+        def sample(self, request, **_kwargs):
+            self.sample_widths.append(request.num_samples)
+            if request.num_samples > 1:
+                self.generate_batch(request.prompt_token_ids, request)
+            dummy = Sample(
+                text="ok",
+                prompt_token_ids=list(request.prompt_token_ids or [1]),
+                completion_token_ids=[7],
+                rollout_logprobs=[-0.2],
+                finish_reason="stop",
+                policy_snapshot_id="snap",
+                training_version=0,
+                proxy_request_id="prid",
+            )
+            return SampleResponse(samples=[dummy] * request.num_samples)
+
+    inner = _BatchRecorder()
+    engine = SingleThreadEngine(engine=inner, sample_coalesce_s=0.05)
+    request = SampleRequest(prompt_token_ids=[1, 2, 3], num_samples=1, max_tokens=8)
+    barrier = threading.Barrier(2)
+    results: list = []
+
+    def _worker() -> None:
+        barrier.wait()
+        results.append(engine.sample(request))
+
+    try:
+        threads = [threading.Thread(target=_worker) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert len(results) == 2
+        assert all(len(response.samples) == 1 for response in results)
+        assert inner.generate_batch_calls == 1
+        assert inner.sample_widths == [2]
+    finally:
+        engine.shutdown()
+

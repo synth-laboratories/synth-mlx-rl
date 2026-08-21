@@ -16,12 +16,11 @@ policy version being trained.
 
 from __future__ import annotations
 
-import json
-import urllib.error
-import urllib.request
 import uuid
 from dataclasses import dataclass
 from typing import Any
+
+import httpx
 
 ROLLOUT_REQUEST_SCHEMA_VERSION = "training.rollout.request.v1"
 ROLLOUT_SUMMARY_SCHEMA_VERSION = "training.rollout.summary.v1"
@@ -57,7 +56,12 @@ class RolloutSummary:
 
 
 class ContainerRolloutClient:
-    """Speaks the hosted rollout contract to a task container."""
+    """Speaks the hosted rollout contract to a task container.
+
+    `rollout` is safe to call from many threads. The httpx client pools
+    keep-alive connections so concurrent group members do not serialise on
+    handshake.
+    """
 
     def __init__(
         self,
@@ -69,7 +73,7 @@ class ContainerRolloutClient:
         bearer_token: str | None = None,
         max_tokens: int = 512,
         temperature: float = 0.7,
-        connection_mode: str = "close",
+        connection_mode: str = "keep_alive",
         timeout_seconds: float = 300.0,
     ) -> None:
         self._base = base_url.rstrip("/")
@@ -81,22 +85,49 @@ class ContainerRolloutClient:
         self._temperature = temperature
         self._connection_mode = connection_mode
         self._timeout = timeout_seconds
+        self._http = httpx.Client(
+            timeout=timeout_seconds,
+            limits=httpx.Limits(max_connections=64, max_keepalive_connections=32),
+            headers={"Connection": "keep-alive"}
+            if connection_mode == "keep_alive"
+            else {"Connection": "close"},
+        )
+
+    def close(self) -> None:
+        self._http.close()
+
+    def __enter__(self) -> ContainerRolloutClient:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
 
     def _request(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
-        data = None if body is None else json.dumps(body, separators=(",", ":")).encode()
-        headers = {"Content-Type": "application/json"} if data else {}
+        headers = {"Content-Type": "application/json"} if body is not None else {}
         if self._bearer:
             headers["Authorization"] = f"Bearer {self._bearer}"
-        request = urllib.request.Request(
-            f"{self._base}{path}", data=data, headers=headers, method=method
-        )
         try:
-            with urllib.request.urlopen(request, timeout=self._timeout) as response:
-                return json.loads(response.read() or b"null")
-        except urllib.error.HTTPError as exc:
-            detail = (exc.read() or b"").decode(errors="replace")[:400]
-            raise RolloutError(f"rollout_container_http_{exc.code}: {detail}") from exc
-        except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+            response = self._http.request(
+                method,
+                f"{self._base}{path}",
+                json=body,
+                headers=headers,
+            )
+            if response.status_code >= 400:
+                detail = (response.text or "")[:400]
+                raise RolloutError(
+                    f"rollout_container_http_{response.status_code}: {detail}"
+                )
+            if not response.content:
+                return None
+            return response.json()
+        except RolloutError:
+            raise
+        except (
+            httpx.TimeoutException,
+            httpx.NetworkError,
+            httpx.RemoteProtocolError,
+        ) as exc:
             # Same name the hosted lane uses, so the two lanes fail alike.
             raise RolloutError("training_rollout_env_unreachable") from exc
 

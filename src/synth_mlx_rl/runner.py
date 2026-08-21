@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import random
 import threading
-import uuid
 import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 from pathlib import Path
 from statistics import fmean, pstdev
 from typing import Callable, Protocol
@@ -43,6 +45,7 @@ class _MinibatchStream:
         self._order = list(range(count))
         self.epoch = 1
         self._cursor = 0
+        self._lock = threading.Lock()
         self._reshuffle()
 
     def _reshuffle(self) -> None:
@@ -50,16 +53,17 @@ class _MinibatchStream:
             self._random.shuffle(self._order)
 
     def next_batch(self) -> list[int]:
-        batch: list[int] = []
-        while len(batch) < self._batch_size:
-            if self._cursor >= self._count:
-                self.epoch += 1
-                self._cursor = 0
-                self._reshuffle()
-            take = min(self._batch_size - len(batch), self._count - self._cursor)
-            batch.extend(self._order[self._cursor : self._cursor + take])
-            self._cursor += take
-        return batch
+        with self._lock:
+            batch: list[int] = []
+            while len(batch) < self._batch_size:
+                if self._cursor >= self._count:
+                    self.epoch += 1
+                    self._cursor = 0
+                    self._reshuffle()
+                take = min(self._batch_size - len(batch), self._count - self._cursor)
+                batch.extend(self._order[self._cursor : self._cursor + take])
+                self._cursor += take
+            return batch
 
 
 def _datum_from_action(datum_cls, action, advantage: float, *, sequence_cap: int):
@@ -118,6 +122,14 @@ def _mlx_peak_memory() -> int | None:
 
 class Cancelled(Exception):
     """Raised when a user-cancelled job reaches a safe step boundary."""
+
+
+class DurableTrainingError(RuntimeError):
+    """A terminal training refusal whose machine-readable code is stable."""
+
+    def __init__(self, code: str, detail: str | None = None) -> None:
+        super().__init__(detail or code)
+        self.code = code
 
 
 class TrainingRunner:
@@ -264,11 +276,20 @@ class TrainingRunner:
         except Exception as exc:  # Errors are structured and persisted, not only logged.
             job = self.store.load_job(job_id)
             job.status = JobStatus.FAILED
-            job.error_code = type(exc).__name__.lower()
+            job.error_code = (
+                exc.code if isinstance(exc, DurableTrainingError)
+                else type(exc).__name__.lower()
+            )
             job.error_detail = str(exc)[:1000]
             job.finished_at = utc_now()
             job.updated_at = job.finished_at
             self.store.save_job(job)
+            if job.error_code == "cispo_no_learning_signal":
+                self.store.append_event(
+                    job_id,
+                    "cispo.no_learning_signal",
+                    {"code": job.error_code, "detail": job.error_detail},
+                )
             self.store.append_event(job_id, "job.failed", {"error_code": job.error_code})
 
     def _run_qwen_lora(
@@ -451,6 +472,12 @@ class TrainingRunner:
         if eval_datums:
             trained_losses = self._qwen_losses(engine, eval_datums)
             self._record_qwen_evaluation(job.job_id, baseline_losses, trained_losses)
+        # Chat defaults resolve the latest published snapshot. Publish the
+        # trained adapter only after the bounded SFT job is complete so future
+        # completions use it rather than the startup adapter.
+        engine.publish_snapshot(
+            metadata={"reason": "sft_complete", "job_id": job.job_id}
+        )
 
     def _run_cispo(
         self, job: Job, cancelled: threading.Event, resuming: bool = False
@@ -491,22 +518,41 @@ class TrainingRunner:
             temperature=target.temperature,
             connection_mode=target.connection_mode,
         )
+        try:
+            self._cispo_with_client(job, cancelled, resuming, engine, client)
+        finally:
+            client.close()
+
+    def _cispo_with_client(self, job, cancelled, resuming, engine, client) -> None:
+        # This method also runs directly in lane tests and owns the full CISPO
+        # loop; imports local to `_run_cispo` are not in its Python scope.
+        from synth_mlx_rl.schemas import AdamParams, Datum, ForwardBackwardRequest
+
+        target = job.config.rollout
+        assert target is not None
         # Rollout identity is the container's idempotency key, so it has to be
         # unique per launch. A stable id means a relaunched job replays the
         # previous attempt's cached result -- including a cached failure.
         launch = uuid.uuid4().hex[:8]
         capabilities = client.capabilities()
-        if capabilities.get("max_concurrency", 1) < 1:
+        max_concurrency = int(capabilities.get("max_concurrency", 1))
+        if max_concurrency < 1:
             raise RuntimeError("rollout_container_advertises_no_capacity")
+        rollout_slots = threading.BoundedSemaphore(max_concurrency)
         job = self.store.load_job(job.job_id)
         job.render_contract = {
             "rollout_container_id": capabilities.get("container_id"),
             "rollout_container_digest": capabilities.get("container_digest"),
             "rollout_capability_hash": capabilities.get("capability_hash"),
+            "rollout_max_concurrency": max_concurrency,
             "task_id": target.task_id,
             "objective": job.config.objective,
             "eps_low": job.config.eps_low,
             "eps_high": job.config.eps_high,
+            # Tinker names the actual ratio bound; this API names the delta
+            # from one. Keeping both prevents eps_high=4 from being reported as
+            # a bound of 4 when it is exactly 1 + 4 = 5.
+            "clip_high": 1.0 + job.config.eps_high,
         }
         self.store.save_job(job)
         self.store.append_event(
@@ -517,6 +563,19 @@ class TrainingRunner:
             engine.load_checkpoint(Path(job.checkpoints[-1].path).name)
             start_step = job.current_step + 1
         else:
+            if job.config.warm_start_job_id is not None:
+                warm_start = self.store.load_job(job.config.warm_start_job_id)
+                checkpoint = warm_start.checkpoints[-1]
+                engine.load_checkpoint(Path(checkpoint.path).name)
+                self.store.append_event(
+                    job.job_id,
+                    "cispo.warm_started",
+                    {
+                        "sft_job_id": warm_start.job_id,
+                        "checkpoint_id": checkpoint.checkpoint_id,
+                        "task_id": target.task_id,
+                    },
+                )
             start_step = 1
 
         instances = _MinibatchStream(
@@ -530,7 +589,9 @@ class TrainingRunner:
 
         baseline = job.evaluation.get("baseline")
         if not resuming:
-            baseline = self._heldout_reward(job, client, cancelled, "baseline", launch)
+            baseline = self._heldout_reward(
+                job, client, cancelled, "baseline", launch, rollout_slots, max_concurrency
+            )
             job = self.store.load_job(job.job_id)
             job.evaluation = {**job.evaluation, "baseline": baseline}
             self.store.save_job(job)
@@ -556,14 +617,9 @@ class TrainingRunner:
             # answered from the run's own record. On a slow or paid environment
             # that distinction is the whole cost model.
             rollout_started = time.monotonic()
-            groups: list[tuple[list, list[float]]] = []
-            attempts_used = 0
-            for group_index in range(job.config.groups_per_step):
-                summaries, rewards, attempts = self._collect_group(
-                    job, client, cancelled, step, group_index, policy_version, instances, launch
-                )
-                attempts_used += attempts
-                groups.append((summaries, rewards))
+            groups, attempts_used = self._collect_step_groups(
+                job, client, cancelled, step, policy_version, instances, launch, rollout_slots
+            )
             rollout_seconds = time.monotonic() - rollout_started
             rollouts_collected = attempts_used * job.config.group_size
             rollouts_used = len(groups) * job.config.group_size
@@ -608,6 +664,7 @@ class TrainingRunner:
             engine.optim_step(optimizer)
             update_seconds = time.monotonic() - update_started
 
+            clip_high = 1.0 + job.config.eps_high
             self._record_step(
                 job.job_id,
                 step,
@@ -625,6 +682,7 @@ class TrainingRunner:
                     "advantage_mean": fmean(advantage_values),
                     "advantage_std": pstdev(advantage_values),
                     "clip_fraction": metrics.get("clip_fraction"),
+                    "clip_high": clip_high,
                     "mean_ratio": metrics.get("mean_ratio"),
                     "completion_tokens": completion_tokens,
                     "rollout_seconds": rollout_seconds,
@@ -637,15 +695,35 @@ class TrainingRunner:
                     "groups_filtered": attempts_used - len(groups),
                 },
             )
+            self.store.append_event(
+                job.job_id,
+                "training.clip",
+                {
+                    "eps_high": job.config.eps_high,
+                    "tinker_bound": clip_high,
+                    "identity": "1+eps_high",
+                    "clip_fraction": metrics.get("clip_fraction"),
+                    "step": step,
+                },
+            )
             if step % job.config.checkpoint_every == 0 or step == job.config.max_steps:
                 saved = engine.save_checkpoint(f"{job.job_id}-step-{step:06d}")
                 self._adapter_checkpoint(job.job_id, step, Path(saved.path))
 
-        trained = self._heldout_reward(job, client, cancelled, "trained", launch)
+        trained = self._heldout_reward(
+            job, client, cancelled, "trained", launch, rollout_slots, max_concurrency
+        )
         self._record_policy_evaluation(job.job_id, baseline, trained)
 
     def _heldout_reward(
-        self, job: Job, client, cancelled: threading.Event, phase: str, launch: str
+        self,
+        job: Job,
+        client,
+        cancelled: threading.Event,
+        phase: str,
+        launch: str,
+        rollout_slots: threading.BoundedSemaphore | None = None,
+        max_concurrency: int = 32,
     ) -> dict:
         """Mean reward over the frozen held-out instances, greedily sampled.
 
@@ -657,19 +735,31 @@ class TrainingRunner:
 
         target = job.config.rollout
         assert target is not None
-        rewards: list[float] = []
-        for index in range(target.heldout_instances):
+        n = target.heldout_instances
+        rewards = [0.0] * n
+
+        def _one(index: int) -> tuple[int, float]:
             self._cancel_boundary(cancelled)
-            summary = client.rollout(
-                job_id=job.job_id,
-                attempt_id=f"{job.job_id}-eval-{phase}",
-                policy_version=f"{phase}",
-                rollout_id=f"{job.job_id}-{launch}-eval-{phase}-{index}",
-                task_instance_id=f"seed:{index}",
-                world_ref=target.heldout_world_ref,
-                temperature=0.01,
-            )
-            rewards.append(summary.reward)
+            slot = rollout_slots or nullcontext()
+            with slot:
+                summary = client.rollout(
+                    job_id=job.job_id,
+                    attempt_id=f"{job.job_id}-eval-{phase}",
+                    policy_version=f"{phase}",
+                    rollout_id=f"{job.job_id}-{launch}-eval-{phase}-{index}",
+                    task_instance_id=f"seed:{index}",
+                    world_ref=target.heldout_world_ref,
+                    temperature=0.01,
+                )
+            return index, summary.reward
+
+        if n:
+            workers = min(n, max(1, max_concurrency))
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="cispo-eval") as pool:
+                futures = [pool.submit(_one, index) for index in range(n)]
+                for future in as_completed(futures):
+                    index, reward = future.result()
+                    rewards[index] = reward
         outcome = {
             "phase": phase,
             "instances": len(rewards),
@@ -718,6 +808,51 @@ class TrainingRunner:
             },
         )
 
+    def _collect_step_groups(
+        self,
+        job: Job,
+        client,
+        cancelled: threading.Event,
+        step: int,
+        policy_version: str,
+        instances: "_MinibatchStream",
+        launch: str,
+        rollout_slots: threading.BoundedSemaphore | None = None,
+    ) -> tuple[list[tuple[list, list[float]]], int]:
+        """Collect `groups_per_step` groups concurrently.
+
+        A zero-advantage filter retries that group on a different instance
+        without stalling siblings. Results are stored by group index so the
+        training batch order stays stable.
+        """
+
+        n = job.config.groups_per_step
+        grouped: list[tuple[list, list[float]] | None] = [None] * n
+        attempts_used = 0
+        workers = max(1, n)
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="cispo-group") as pool:
+            futures = {
+                pool.submit(
+                    self._collect_group,
+                    job,
+                    client,
+                    cancelled,
+                    step,
+                    group_index,
+                    policy_version,
+                    instances,
+                    launch,
+                    rollout_slots,
+                ): group_index
+                for group_index in range(n)
+            }
+            for future in as_completed(futures):
+                group_index = futures[future]
+                summaries, rewards, attempts = future.result()
+                grouped[group_index] = (summaries, rewards)
+                attempts_used += attempts
+        return [item for item in grouped if item is not None], attempts_used
+
     def _collect_group(
         self,
         job: Job,
@@ -728,6 +863,7 @@ class TrainingRunner:
         policy_version: str,
         instances: "_MinibatchStream",
         launch: str,
+        rollout_slots: threading.BoundedSemaphore | None = None,
     ):
         """One group with a usable signal, or a failure that says why.
 
@@ -747,17 +883,22 @@ class TrainingRunner:
         for attempt in range(1, job.config.signal_attempts + 1):
             self._cancel_boundary(cancelled)
             instance = instances.next_batch()[0]
-            summaries = []
-            for member in range(job.config.group_size):
-                summary = client.rollout(
-                    job_id=job.job_id,
-                    attempt_id=f"{job.job_id}-s{step:04d}-g{group_index}-a{attempt}",
-                    policy_version=policy_version,
-                    rollout_id=f"{job.job_id}-{launch}-s{step:04d}-g{group_index}-a{attempt}-r{member}",
-                    task_instance_id=f"seed:{instance}",
-                    world_ref=job.config.rollout.train_world_ref,
-                )
-                summaries.append(summary)
+            summaries: list = [None] * job.config.group_size
+
+            def _one_member(member: int) -> tuple[int, object]:
+                self._cancel_boundary(cancelled)
+                slot = rollout_slots or nullcontext()
+                with slot:
+                    summary = client.rollout(
+                        job_id=job.job_id,
+                        attempt_id=f"{job.job_id}-s{step:04d}-g{group_index}-a{attempt}",
+                        policy_version=policy_version,
+                        rollout_id=(
+                            f"{job.job_id}-{launch}-s{step:04d}-g{group_index}-a{attempt}-r{member}"
+                        ),
+                        task_instance_id=f"seed:{instance}",
+                        world_ref=job.config.rollout.train_world_ref,
+                    )
                 self.store.append_event(
                     job.job_id,
                     "rollout.completed",
@@ -769,6 +910,14 @@ class TrainingRunner:
                         "container_digest": summary.container_digest,
                     },
                 )
+                return member, summary
+
+            workers = max(1, job.config.group_size)
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="cispo-member") as pool:
+                futures = [pool.submit(_one_member, member) for member in range(job.config.group_size)]
+                for future in as_completed(futures):
+                    member, summary = future.result()
+                    summaries[member] = summary
             rewards = [summary.reward for summary in summaries]
             if has_learning_signal(rewards):
                 return summaries, rewards, attempt
@@ -784,7 +933,7 @@ class TrainingRunner:
                     "rewards": rewards,
                 },
             )
-        raise RuntimeError("cispo_no_learning_signal")
+        raise DurableTrainingError("cispo_no_learning_signal")
 
     @staticmethod
     def _qwen_losses(engine: TrainingEngine, datums: list) -> list[float]:

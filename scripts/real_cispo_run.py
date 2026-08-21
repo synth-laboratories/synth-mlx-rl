@@ -143,6 +143,7 @@ def main() -> int:
                 "config": {
                     "backend": "qwen_lora",
                     "base_model": BASE_MODEL,
+                    "task_id": capabilities["task_id"],
                     "dataset": {"path": str(args.warmstart_train.resolve())},
                     **(
                         {"evaluation_dataset": {"path": str(args.warmstart_eval.resolve())}}
@@ -193,6 +194,11 @@ def main() -> int:
             "config": {
                 "backend": "cispo",
                 "base_model": BASE_MODEL,
+                **(
+                    {"warm_start_job_id": "warmstart"}
+                    if args.warmstart_train is not None
+                    else {}
+                ),
                 "output_dir": str(root / "output"),
                 "rollout": {
                     "url": args.container,

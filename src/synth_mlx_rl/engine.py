@@ -51,7 +51,13 @@ from .schemas import (
     SampleRequest,
     StateResponse,
 )
-from .snapshots import PolicySnapshot
+from .snapshots import (
+    PolicySnapshot,
+    SnapshotError,
+    SnapshotEvictedError,
+    SnapshotNotFoundError,
+)
+from .storage import sha256_path
 
 
 class MLXUnavailableError(RuntimeError):
@@ -115,6 +121,8 @@ class MLXEngine(EngineBase):
     meaningless.
     """
 
+    supports_cispo = True
+
     def __init__(self, settings: Settings):
         try:
             import mlx.core as mx
@@ -145,7 +153,10 @@ class MLXEngine(EngineBase):
         if hasattr(mx, "random"):
             mx.random.seed(settings.seed)
 
-        self.model, self.tokenizer = load(settings.model)
+        # Never hand a Hub id to mlx-lm here: doing so can turn engine startup
+        # into an unannounced network download. Workshop supplies a managed
+        # snapshot, with an already-populated HF cache as the only fallback.
+        self.model, self.tokenizer = load(str(settings.require_local_model_path()))
         self.model.freeze()
 
         if not hasattr(self.model, "layers") or not self.model.layers:
@@ -1043,10 +1054,22 @@ class MLXEngine(EngineBase):
             self._accumulation_weight = 0.0
             self.mx.eval(self.model.parameters())
             self._maybe_clear_cache()
-            # Loading different weights makes every previously published
-            # snapshot describe a policy this service can no longer produce, so
-            # publish a fresh one rather than leaving a stale "latest" pointer.
-            self.publish_snapshot(metadata={"reason": "checkpoint_load", "name": name})
+            digest, _ = sha256_path(path)
+            snapshot_id = f"sha256:{digest}"
+            try:
+                self.snapshots.get(snapshot_id)
+            except (SnapshotNotFoundError, SnapshotEvictedError):
+                try:
+                    self.publish_snapshot(
+                        snapshot_id=snapshot_id,
+                        metadata={
+                            "reason": "checkpoint_load",
+                            "name": name,
+                            "sha256": digest,
+                        },
+                    )
+                except SnapshotError:
+                    pass
             return CheckpointResponse(
                 path=str(path),
                 step=self._step,

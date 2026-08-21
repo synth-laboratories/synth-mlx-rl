@@ -9,13 +9,12 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from .. import __version__
 from ..config import Settings
 from ..protocols import LearnerEngine
-from ..serialize import SingleThreadEngine
 from ..schemas import (
     CheckpointRequest,
     CheckpointResponse,
@@ -33,6 +32,7 @@ from ..schemas import (
     TokenizeRequest,
     TokenizeResponse,
 )
+from ..serialize import SingleThreadEngine
 from ..snapshots import SnapshotError
 from . import chat_completions, responses, synth
 from .common import get_engine, idempotency_key, snapshot_http_error
@@ -66,6 +66,7 @@ def create_app(
     *,
     engine: LearnerEngine | None = None,
     settings: Settings | None = None,
+    defer_engine: bool = False,
 ) -> FastAPI:
     configured_settings = settings or Settings.from_env()
 
@@ -85,7 +86,7 @@ def create_app(
 
                 return MLXEngine(configured_settings)
 
-            app.state.engine = SingleThreadEngine(factory=build)
+            app.state.engine = SingleThreadEngine(factory=build, lazy=defer_engine)
         app.state.idempotency = IdempotencyCache()
         try:
             yield

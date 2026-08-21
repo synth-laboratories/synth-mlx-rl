@@ -83,11 +83,13 @@ class LocalTrainingService:
         settings: Settings,
         engine_provider=None,
         qwen_available_override: bool | None = None,
+        cispo_available_override: bool | None = None,
         sampler_base_url: str = "http://127.0.0.1:8787",
     ) -> None:
         self.store = JobStore(root)
         self.settings = settings
         self.qwen_available_override = qwen_available_override
+        self.cispo_available_override = cispo_available_override
         self.sampler_base_url = sampler_base_url.rstrip("/")
         self.runner = TrainingRunner(
             self.store,
@@ -106,10 +108,21 @@ class LocalTrainingService:
             mlx_available = True
         except ImportError:
             mlx_available = False
-        qwen_available = (
+        runtime_available = (
             self.qwen_available_override
             if self.qwen_available_override is not None
             else apple_silicon and mlx_available
+        )
+        model_available = (
+            True
+            if self.qwen_available_override is True
+            else self.settings.local_model_path() is not None
+        )
+        qwen_available = runtime_available and model_available
+        cispo_available = (
+            self.cispo_available_override
+            if self.cispo_available_override is not None
+            else qwen_available
         )
         return Capabilities(
             service_version=__version__,
@@ -127,15 +140,27 @@ class LocalTrainingService:
                     reason=(
                         None
                         if qwen_available
-                        else "Qwen LoRA requires Apple Silicon, mlx, and mlx-lm"
+                        else (
+                            "Qwen/Qwen3.5-0.8B is not downloaded for on-device training"
+                            if runtime_available and not model_available
+                            else "Qwen LoRA requires Apple Silicon, mlx, and mlx-lm"
+                        )
                     ),
                 ),
                 "cispo_training": Capability(
-                    supported=qwen_available,
+                    supported=cispo_available,
                     reason=(
                         None
-                        if qwen_available
-                        else "the on-policy lane needs the same MLX stack as SFT"
+                        if cispo_available
+                        else (
+                            "Qwen/Qwen3.5-0.8B is not downloaded for on-device training"
+                            if runtime_available and not model_available
+                            else (
+                                "CISPO requires Apple Silicon, mlx, and mlx-lm"
+                                if not runtime_available
+                                else "CISPO is not implemented by the resident training engine"
+                            )
+                        )
                     ),
                 ),
                 "resume_from_checkpoint": Capability(
@@ -166,6 +191,23 @@ class LocalTrainingService:
     def preflight(self, request: ConfigureRequest) -> Preflight:
         config = request.config
         checks: dict[str, Capability] = {}
+        model_path = (
+            Path("<injected-engine>")
+            if self.qwen_available_override is True
+            else self.settings.local_model_path()
+        )
+        checks["model"] = Capability(
+            supported=model_path is not None,
+            reason=(
+                None
+                if model_path is not None
+                else (
+                    "Qwen/Qwen3.5-0.8B is not available locally. Download it in "
+                    "Workshop Settings → Models → On-device training and pass "
+                    "SYNTH_MLX_RL_MODEL_PATH as the snapshot directory."
+                )
+            ),
+        )
         # The on-policy lane has no dataset: its data is the rollouts it
         # collects, so a dataset check there would refuse a valid config.
         dataset = Path(config.dataset.path).expanduser() if config.dataset else None
@@ -224,7 +266,11 @@ class LocalTrainingService:
         dataset_bytes = 0
         if dataset_on_disk:
             dataset_bytes = dataset.stat().st_size
-            rows = sum(1 for line in dataset.read_text(encoding="utf-8").splitlines() if line.strip())
+            rows = sum(
+                1
+                for line in dataset.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            )
         if config.backend == "cispo":
             # A rollout's length is bounded by the prompt plus `max_tokens`, and
             # a micro-batch holds that many sequences.
@@ -254,12 +300,38 @@ class LocalTrainingService:
             ),
         )
         if config.backend == "cispo":
+            assert config.rollout is not None
+            if config.warm_start_job_id is not None:
+                try:
+                    warm_start = self.store.load_job(config.warm_start_job_id)
+                except FileNotFoundError:
+                    checks["warm_start"] = Capability(
+                        supported=False,
+                        reason="warm-start SFT job does not exist",
+                    )
+                else:
+                    same_task = (
+                        warm_start.config.backend == "qwen_lora"
+                        and warm_start.status.value == "succeeded"
+                        and bool(warm_start.checkpoints)
+                        and warm_start.config.task_id == config.rollout.task_id
+                    )
+                    checks["warm_start"] = Capability(
+                        supported=same_task,
+                        reason=(
+                            None
+                            if same_task
+                            else (
+                                "warm-start must be a succeeded qwen_lora job "
+                                "with a terminal adapter and the same task_id"
+                            )
+                        ),
+                    )
             # Spend-free: ask the container what it can do before any rollout
             # runs. An on-policy step that discovers its environment is
             # unreachable has already published a snapshot and burned a step.
             from synth_mlx_rl.rollout_client import ContainerRolloutClient, RolloutError
 
-            assert config.rollout is not None
             probe = ContainerRolloutClient(
                 base_url=config.rollout.url,
                 task_id=config.rollout.task_id,
@@ -289,7 +361,7 @@ class LocalTrainingService:
         if config.base_model != "Qwen/Qwen3.5-0.8B":
             capability = Capability(
                 supported=False,
-                reason="v0.6 local SFT supports exactly Qwen/Qwen3.5-0.8B",
+                reason="the bounded v0.7 recipe supports exactly Qwen/Qwen3.5-0.8B",
             )
         if (
             config.base_model != self.settings.model
@@ -362,7 +434,11 @@ def create_app(
     configured = (settings or Settings.from_env()).with_overrides(
         checkpoint_dir=root_path / "adapters"
     )
-    app = create_learning_app(engine=engine, settings=configured)
+    app = create_learning_app(
+        engine=engine,
+        settings=configured,
+        defer_engine=engine is None,
+    )
     # Replace the inference-only health route with a service health response
     # that remains useful while the resident model is still loading.
     app.router.routes = [
@@ -373,6 +449,11 @@ def create_app(
         configured,
         lambda: app.state.engine,
         qwen_available_override=True if engine is not None else None,
+        cispo_available_override=(
+            bool(getattr(engine, "supports_cispo", False))
+            if engine is not None
+            else None
+        ),
         sampler_base_url=sampler_base_url,
     )
     app.state.service = service

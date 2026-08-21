@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import tempfile
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -54,6 +55,7 @@ class JobStore:
     def __init__(self, root: Path) -> None:
         self.root = root.expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
+        self._io = threading.Lock()
 
     def job_dir(self, job_id: str) -> Path:
         if not job_id.replace("-", "").replace("_", "").isalnum():
@@ -68,11 +70,13 @@ class JobStore:
 
     def save_job(self, job: Job) -> None:
         path = self.job_dir(job.job_id) / "job.json"
-        self._atomic_write(path, job.model_dump(mode="json"))
+        with self._io:
+            self._atomic_write(path, job.model_dump(mode="json"))
 
     def load_job(self, job_id: str) -> Job:
         path = self.job_dir(job_id) / "job.json"
-        return Job.model_validate_json(path.read_text())
+        with self._io:
+            return Job.model_validate_json(path.read_text())
 
     def list_jobs(self) -> list[Job]:
         jobs: list[Job] = []
@@ -88,37 +92,42 @@ class JobStore:
     ) -> Event:
         directory = self.job_dir(job_id)
         events_path = directory / "events.jsonl"
-        sequence = 1
-        if events_path.exists():
-            with events_path.open("rb") as handle:
-                for sequence, _line in enumerate(handle, start=1):
-                    pass
-            sequence += 1
-        event = Event(sequence=sequence, type=type_, timestamp=utc_now(), payload=payload or {})
-        with events_path.open("a", encoding="utf-8") as handle:
-            handle.write(event.model_dump_json() + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        return event
+        with self._io:
+            sequence = 1
+            if events_path.exists():
+                with events_path.open("rb") as handle:
+                    for sequence, _line in enumerate(handle, start=1):
+                        pass
+                sequence += 1
+            event = Event(sequence=sequence, type=type_, timestamp=utc_now(), payload=payload or {})
+            with events_path.open("a", encoding="utf-8") as handle:
+                handle.write(event.model_dump_json() + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            return event
 
     def events_after(self, job_id: str, after: int = 0) -> list[Event]:
         path = self.job_dir(job_id) / "events.jsonl"
-        if not path.exists():
-            return []
-        return [
-            event
-            for event in (
-                Event.model_validate_json(line) for line in path.read_text().splitlines() if line
-            )
-            if event.sequence > after
-        ]
+        with self._io:
+            if not path.exists():
+                return []
+            return [
+                event
+                for event in (
+                    Event.model_validate_json(line)
+                    for line in path.read_text().splitlines()
+                    if line
+                )
+                if event.sequence > after
+            ]
 
     def append_metric(self, job_id: str, metric: dict[str, Any]) -> None:
         path = self.job_dir(job_id) / "metrics.jsonl"
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(metric, sort_keys=True) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+        with self._io:
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(metric, sort_keys=True) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
 
     def recover_interrupted(self) -> list[str]:
         recovered: list[str] = []

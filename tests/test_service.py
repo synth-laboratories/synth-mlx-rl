@@ -22,7 +22,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from synth_mlx_rl.config import Settings
-from synth_mlx_rl.service import create_app
+from synth_mlx_rl.service import LocalTrainingService, create_app
 from synth_mlx_rl.storage import sha256_path
 
 RESIDENT = dict(
@@ -38,8 +38,16 @@ RESIDENT = dict(
 def _client(root: Path, tmp_path: Path) -> Iterator[TestClient]:
     """A service whose only backend is real, driven by a fake engine."""
     settings = Settings(checkpoint_dir=tmp_path / "adapters", **RESIDENT)
+    _require_real_backend(settings)
     with TestClient(create_app(root, settings=settings)) as client:
         yield client
+
+
+def _require_real_backend(settings: Settings) -> None:
+    pytest.importorskip("mlx.core")
+    pytest.importorskip("mlx_lm")
+    if settings.local_model_path() is None:
+        pytest.skip("Qwen/Qwen3.5-0.8B is not downloaded locally")
 
 
 def _payload(tmp_path: Path, *, job_id: str = "local-run", steps: int = 3) -> dict[str, object]:
@@ -82,6 +90,54 @@ def test_the_service_offers_exactly_one_backend(tmp_path: Path) -> None:
     assert "fixture_training" not in capabilities
     assert "mlx_scalar_smoke" not in capabilities
     assert capabilities["qwen_lora_training"]["supported"] is True
+
+
+def test_cispo_capability_is_independent_of_sft_runtime_availability(
+    tmp_path: Path,
+) -> None:
+    service = LocalTrainingService(
+        tmp_path / "service",
+        Settings(checkpoint_dir=tmp_path / "adapters"),
+        qwen_available_override=True,
+        cispo_available_override=False,
+    )
+    capabilities = service.capabilities().capabilities
+    assert capabilities["qwen_lora_training"].supported is True
+    assert capabilities["cispo_training"].supported is False
+
+
+def test_preflight_refuses_when_no_managed_path_or_cache_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "empty-hf"))
+    monkeypatch.delenv("HF_HUB_CACHE", raising=False)
+    settings = Settings(
+        model_path=tmp_path / "missing-managed-snapshot",
+        checkpoint_dir=tmp_path / "adapters",
+        lora_rank=8,
+        lora_alpha=16.0,
+        max_seq_length=1024,
+        enable_thinking=False,
+    )
+    with TestClient(create_app(tmp_path / "service", settings=settings)) as client:
+        preflight = client.post(
+            "/v1/jobs/preflight", json=_payload(tmp_path, job_id="missing-model")
+        ).json()
+    assert preflight["accepted"] is False
+    assert preflight["checks"]["model"]["supported"] is False
+    assert "Workshop Settings" in preflight["checks"]["model"]["reason"]
+
+
+def test_managed_model_snapshot_is_preferred_over_hf_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    for name in ("config.json", "tokenizer_config.json", "model.safetensors"):
+        (managed / name).write_text("{}")
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "other-cache"))
+    monkeypatch.delenv("HF_HUB_CACHE", raising=False)
+    assert Settings(model_path=managed).local_model_path() == managed.resolve()
 
 
 def test_an_unknown_backend_is_refused_at_the_wire(tmp_path: Path) -> None:
@@ -201,6 +257,7 @@ def test_qwen_lora_job_persists_real_adapter_contract_and_render_lineage(
         max_seq_length=1024,
         enable_thinking=False,
     )
+    _require_real_backend(settings)
     dataset = tmp_path / "qwen.jsonl"
     dataset.write_text(
         '{"messages":[{"role":"user","content":"Say ready"},'
