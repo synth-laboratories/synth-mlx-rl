@@ -821,6 +821,14 @@ class MLXEngine(EngineBase):
                     self._grad_accum,
                     weighted_gradients,
                 )
+            # Break the lazy graph after every micro-batch.  A trajectory
+            # workload can contribute hundreds of actions to one optimizer
+            # step; leaving the accumulation tree lazy until ``optim_step``
+            # makes Metal encode that entire chain at once and eventually hit
+            # its resource limit even though each micro-batch fits in memory.
+            # Materializing here preserves the exact summed-gradient semantics
+            # while bounding the graph and command-buffer size.
+            self._evaluate_tree(self._grad_accum)
             self._accumulation_count += 1
             self._accumulation_weight += batch_weight
             metrics["accumulation_token_weight"] = self._accumulation_weight
