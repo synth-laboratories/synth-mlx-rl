@@ -44,6 +44,8 @@ _PROXIED = (
     "zero_grad",
     "publish_snapshot",
     "resolve_snapshot",
+    "register_policy",
+    "load_training_adapter",
     "save_checkpoint",
     "load_checkpoint",
 )
