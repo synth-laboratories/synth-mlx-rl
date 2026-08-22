@@ -18,7 +18,7 @@ from synth_mlx_rl.rewards import (
     has_learning_signal,
     normalize_group_rewards,
 )
-from synth_mlx_rl.rollout_client import RolloutAction, RolloutError
+from synth_mlx_rl.rollout_client import ContainerRolloutClient, RolloutAction, RolloutError
 from synth_mlx_rl.runner import _datum_from_action
 from synth_mlx_rl.schemas import Datum
 
@@ -92,6 +92,26 @@ def test_a_token_receipt_that_does_not_line_up_is_refused() -> None:
         ).validate()
     with pytest.raises(RolloutError, match="empty"):
         RolloutAction(prompt_token_ids=(), token_ids=(3,), log_probs=(-0.1,)).validate()
+
+
+def test_rollout_capabilities_require_an_exact_dataset_digest(monkeypatch) -> None:
+    client = ContainerRolloutClient(
+        base_url="http://container.invalid",
+        task_id="task.v1",
+        sampler_url="http://sampler.invalid",
+        sampler_token="token",
+    )
+    payload = {
+        "schema_version": "training.rollout.capabilities.v1",
+        "protocol_versions": ["training.rollout.request.v1"],
+        "task_id": "task.v1",
+    }
+    monkeypatch.setattr(client, "_request", lambda *_args, **_kwargs: payload)
+    with pytest.raises(RolloutError, match="dataset_digest"):
+        client.capabilities()
+
+    payload["dataset_digest"] = "sha256:" + "a" * 64
+    assert client.capabilities()["dataset_digest"] == payload["dataset_digest"]
 
 
 def test_the_lane_refuses_a_configuration_it_cannot_honour() -> None:

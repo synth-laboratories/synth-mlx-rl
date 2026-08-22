@@ -506,10 +506,13 @@ class TrainingRunner:
         if capabilities.get("max_concurrency", 1) < 1:
             raise RuntimeError("rollout_container_advertises_no_capacity")
         job = self.store.load_job(job.job_id)
+        dataset_digest = str(capabilities["dataset_digest"])
+        job.dataset_sha256 = dataset_digest.removeprefix("sha256:")
         job.render_contract = {
             "rollout_container_id": capabilities.get("container_id"),
             "rollout_container_digest": capabilities.get("container_digest"),
             "rollout_capability_hash": capabilities.get("capability_hash"),
+            "dataset_digest": dataset_digest,
             "task_id": target.task_id,
             "objective": job.config.objective,
             "eps_low": job.config.eps_low,
