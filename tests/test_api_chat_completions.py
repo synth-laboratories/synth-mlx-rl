@@ -41,6 +41,30 @@ def test_wrong_model_is_refused(client) -> None:
     assert response.json()["detail"]["error_code"] == "model_not_resident"
 
 
+def test_workshop_local_model_alias_resolves_to_the_resident_model(client) -> None:
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "mlx-local-base",
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["model"] != "mlx-local-base"
+
+
+def test_workshop_json_response_format_is_accepted(client) -> None:
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "mlx-local-base",
+            "messages": [{"role": "user", "content": "return JSON"}],
+            "response_format": {"type": "json_object"},
+        },
+    )
+    assert response.status_code == 200, response.text
+
+
 def test_logprobs_on_the_wire_are_refused_with_a_pointer(client) -> None:
     response = client.post(
         "/v1/chat/completions",
