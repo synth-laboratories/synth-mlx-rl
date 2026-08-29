@@ -75,7 +75,7 @@ def _resident_model_matches(requested: str, resident: str) -> bool:
     if requested == resident:
         return True
     managed = os.environ.get("SYNTH_MLX_RL_MODEL_PATH", "").strip()
-    if not managed or requested != "Qwen/Qwen3.5-0.8B":
+    if not managed or requested not in {"Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B"}:
         return False
     try:
         return Path(resident).expanduser().resolve() == Path(managed).expanduser().resolve()
@@ -306,10 +306,10 @@ class LocalTrainingService:
         capability = self.capabilities().capabilities[
             "cispo_training" if config.backend == "cispo" else "qwen_lora_training"
         ]
-        if config.base_model != "Qwen/Qwen3.5-0.8B":
+        if config.base_model not in {"Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B"}:
             capability = Capability(
                 supported=False,
-                reason="v0.6 local SFT supports exactly Qwen/Qwen3.5-0.8B",
+                reason="v0.6 local SFT supports Qwen/Qwen3.5-0.8B or Qwen/Qwen3.5-2B",
             )
         if (
             not _resident_model_matches(config.base_model, self.settings.model)
