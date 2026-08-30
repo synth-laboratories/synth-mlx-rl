@@ -78,7 +78,12 @@ def _resident_model_matches(requested: str, resident: str) -> bool:
     if not managed or requested not in {"Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B"}:
         return False
     try:
-        return Path(resident).expanduser().resolve() == Path(managed).expanduser().resolve()
+        managed_path = Path(managed).expanduser().resolve()
+        requested_parts = tuple(requested.split("/"))
+        return (
+            Path(resident).expanduser().resolve() == managed_path
+            and managed_path.parts[-len(requested_parts) :] == requested_parts
+        )
     except OSError:
         return False
 

@@ -56,6 +56,11 @@ def test_managed_model_path_accepts_qwen35_2b(
     assert _resident_model_matches("Qwen/Qwen3.5-2B", str(managed))
     assert not _resident_model_matches("Qwen/Qwen3.5-0.8B", str(managed))
 
+    renamed = tmp_path / "renamed" / "Qwen3.5-2B"
+    renamed.mkdir(parents=True)
+    monkeypatch.setenv("SYNTH_MLX_RL_MODEL_PATH", str(renamed))
+    assert not _resident_model_matches("Qwen/Qwen3.5-2B", str(renamed))
+
 
 @contextmanager
 def _client(root: Path, tmp_path: Path) -> Iterator[TestClient]:
