@@ -28,6 +28,12 @@ class StreamOptions(OpenAIModel):
     include_usage: bool = False
 
 
+class ResponseFormat(OpenAIModel):
+    """OpenAI response-format request accepted by evaluation policy clients."""
+
+    type: Literal["text", "json_object"] = "text"
+
+
 class _SamplingFields(OpenAIModel):
     temperature: float = Field(default=0.7, ge=0.0)
     top_p: float = Field(default=1.0, gt=0.0, le=1.0)
@@ -55,6 +61,7 @@ class ChatCompletionRequest(_SamplingFields):
     user: str | None = None
     logprobs: bool | None = None
     top_logprobs: int | None = None
+    response_format: ResponseFormat | None = None
 
     @model_validator(mode="after")
     def validate_request(self) -> "ChatCompletionRequest":

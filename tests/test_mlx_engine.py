@@ -140,6 +140,28 @@ def test_sampling_is_pinned_across_a_training_step(mlx_engine) -> None:
     assert mlx_engine.state().training_version > pinned.training_version
 
 
+def test_long_accumulation_window_is_materialized_incrementally(mlx_engine) -> None:
+    """Many trajectory actions must not form one unbounded lazy Metal graph."""
+
+    from synth_mlx_rl.schemas import AdamParams, Datum, ForwardBackwardRequest
+
+    tokens = mlx_engine.encode("bounded trajectory action")
+    request = ForwardBackwardRequest(
+        data=[
+            Datum(
+                input_ids=tokens[:-1],
+                target_ids=tokens[1:],
+                weights=[1.0] * (len(tokens) - 1),
+            )
+        ]
+    )
+    for expected in range(1, 65):
+        response = mlx_engine.forward_backward(request)
+        assert response.accumulation_count == expected
+    step = mlx_engine.optim_step(AdamParams(learning_rate=1e-5))
+    assert step.applied_accumulations == 64
+
+
 def test_rollout_logprobs_come_from_the_untruncated_distribution(mlx_engine) -> None:
     """top_p must not change the recorded log-probability of a chosen token."""
 

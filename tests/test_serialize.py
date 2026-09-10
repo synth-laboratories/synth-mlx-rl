@@ -34,6 +34,10 @@ class _ThreadRecorder:
         self.calls.append(threading.get_ident())
         return "fb"
 
+    def register_policy(self, *_args, **_kwargs):
+        self.calls.append(threading.get_ident())
+        return "registered"
+
     settings = "plain-data"
 
 
@@ -55,6 +59,7 @@ def test_every_proxied_call_runs_on_that_same_thread() -> None:
         engine.state()
         engine.sample()
         engine.forward_backward()
+        engine.register_policy()
         threads = set(engine._engine.calls)
         assert len(threads) == 1, f"calls spread across {len(threads)} threads"
         assert threads == {engine._engine.built_on}

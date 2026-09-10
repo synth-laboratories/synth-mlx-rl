@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import tempfile
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -54,6 +55,9 @@ class JobStore:
     def __init__(self, root: Path) -> None:
         self.root = root.expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
+        # Sequence allocation and append are one operation. Training and HTTP
+        # cancellation run on different threads and must never race here.
+        self._events_lock = threading.RLock()
 
     def job_dir(self, job_id: str) -> Path:
         if not job_id.replace("-", "").replace("_", "").isalnum():
@@ -86,37 +90,38 @@ class JobStore:
         type_: str,
         payload: dict[str, object] | None = None,
     ) -> Event:
-        directory = self.job_dir(job_id)
-        events_path = directory / "events.jsonl"
-        sequence = 1
-        if events_path.exists():
-            with events_path.open("rb") as handle:
-                for sequence, _line in enumerate(handle, start=1):
-                    pass
-            sequence += 1
-        now = utc_now()
-        event = Event(
-            sequence=sequence,
-            type=type_,
-            kind=type_,
-            timestamp=now,
-            occurred_at=now,
-            payload=payload or {},
-            schema_version="training.event.v1",
-            event_id=f"{job_id}:{sequence}",
-            job_id=job_id,
-            attempt_id="attempt-1",
-            producer={
-                "service": "synth-mlx-rl",
-                "version": "0.6.0",
-                "commit": "synth-mlx-rl",
-            },
-        )
-        with events_path.open("a", encoding="utf-8") as handle:
-            handle.write(event.model_dump_json() + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        return event
+        with self._events_lock:
+            directory = self.job_dir(job_id)
+            events_path = directory / "events.jsonl"
+            sequence = 1
+            if events_path.exists():
+                with events_path.open("rb") as handle:
+                    for sequence, _line in enumerate(handle, start=1):
+                        pass
+                sequence += 1
+            now = utc_now()
+            event = Event(
+                sequence=sequence,
+                type=type_,
+                kind=type_,
+                timestamp=now,
+                occurred_at=now,
+                payload=payload or {},
+                schema_version="training.event.v1",
+                event_id=f"{job_id}:{sequence}",
+                job_id=job_id,
+                attempt_id="attempt-1",
+                producer={
+                    "service": "synth-mlx-rl",
+                    "version": "0.6.0",
+                    "commit": "synth-mlx-rl",
+                },
+            )
+            with events_path.open("a", encoding="utf-8") as handle:
+                handle.write(event.model_dump_json() + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            return event
 
     def events_after(self, job_id: str, after: int = 0) -> list[Event]:
         path = self.job_dir(job_id) / "events.jsonl"

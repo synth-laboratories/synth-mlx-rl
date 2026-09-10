@@ -82,7 +82,11 @@ def idempotency_key(request: Request) -> str | None:
 
 def check_model(engine: LearnerEngine, requested: str | None) -> str:
     resident = engine.state().model
-    if requested is not None and requested != resident:
+    # Workshop addresses the one app-owned resident model through this stable
+    # logical name. Responses and rollout records still report the resolved
+    # model, so the alias cannot masquerade as a second loaded model.
+    accepted = {resident, "mlx-local-base"}
+    if requested is not None and requested not in accepted:
         raise http_error(
             "model_not_resident",
             f"resident model is {resident!r}, not {requested!r}; this service "

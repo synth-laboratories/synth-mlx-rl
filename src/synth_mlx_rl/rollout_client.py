@@ -115,6 +115,14 @@ class ContainerRolloutClient:
                 f"rollout_task_mismatch: container serves {payload.get('task_id')!r}, "
                 f"configured for {self._task_id!r}"
             )
+        dataset_digest = payload.get("dataset_digest")
+        if not (
+            isinstance(dataset_digest, str)
+            and dataset_digest.startswith("sha256:")
+            and len(dataset_digest) == len("sha256:") + 64
+            and all(character in "0123456789abcdef" for character in dataset_digest[7:])
+        ):
+            raise RolloutError("rollout_container_dataset_digest_missing_or_invalid")
         return payload
 
     def rollout(

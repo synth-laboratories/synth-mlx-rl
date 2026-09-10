@@ -46,6 +46,22 @@ def test_managed_model_path_retains_the_pinned_logical_identity(
     assert not _resident_model_matches("Qwen/Qwen3.5-0.8B", str(tmp_path / "other"))
 
 
+def test_managed_model_path_accepts_qwen35_2b(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    managed = tmp_path / "models" / "Qwen" / "Qwen3.5-2B"
+    managed.mkdir(parents=True)
+    monkeypatch.setenv("SYNTH_MLX_RL_MODEL_PATH", str(managed))
+
+    assert _resident_model_matches("Qwen/Qwen3.5-2B", str(managed))
+    assert not _resident_model_matches("Qwen/Qwen3.5-0.8B", str(managed))
+
+    renamed = tmp_path / "renamed" / "Qwen3.5-2B"
+    renamed.mkdir(parents=True)
+    monkeypatch.setenv("SYNTH_MLX_RL_MODEL_PATH", str(renamed))
+    assert not _resident_model_matches("Qwen/Qwen3.5-2B", str(renamed))
+
+
 @contextmanager
 def _client(root: Path, tmp_path: Path) -> Iterator[TestClient]:
     """A service whose only backend is real, driven by a fake engine."""
